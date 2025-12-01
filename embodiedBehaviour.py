@@ -10,7 +10,6 @@ import random
 import threading
 import signal
 import sys
-import subprocess
 from collections import deque
 
 
@@ -26,7 +25,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     
     THRESH_MEAN = 0.5
     THRESH_VAR = 0.1
-    WAIT_AFTER_ACTION = 1.5
+    WAIT_AFTER_ACTION = 3.0
     COOLDOWN = 2.0
     SELFADAPTOR_PERIOD_CALM = 240.0
     SELFADAPTOR_PERIOD_LIVELY = 120.0
@@ -249,6 +248,12 @@ class EmbodiedBehaviour(yarp.RFModule):
     def _execute_alwayson_command(self, command):
         """Execute always-on start/stop command via native YARP RPC"""
         try:
+            # Ensure connection to /interactionInterface
+            if not yarp.Network.isConnected("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
+                if yarp.Network.exists("/interactionInterface"):
+                    yarp.Network.connect("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface")
+                    time.sleep(0.1)  # Brief delay for connection to stabilize
+            
             cmd_bottle = yarp.Bottle()
             reply_bottle = yarp.Bottle()
             
@@ -488,6 +493,14 @@ class EmbodiedBehaviour(yarp.RFModule):
                     
                     # Execute via native YARP RPC
                     try:
+                        # Ensure connection to /interactionInterface
+                        if not yarp.Network.isConnected("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
+                            print(f"[Proactive] Connecting to /interactionInterface...")
+                            if not yarp.Network.connect("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
+                                print(f"[Proactive] ✗ Could not connect to /interactionInterface")
+                                time.sleep(1.0)
+                                continue
+                        
                         cmd_bottle = yarp.Bottle()
                         reply_bottle = yarp.Bottle()
                         
@@ -508,8 +521,9 @@ class EmbodiedBehaviour(yarp.RFModule):
                         print(f"[Proactive] ✗ Error: {e}")
                         continue
                     
-                    # Wait for effect with early exit if user leaves
-                    print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for effect...")
+                    # Wait for: action completion + human reaction + rolling window to refresh with new data
+                    # This ensures post-state measurement doesn't contain pre-action data
+                    print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for action + reaction + sensor integration...")
                     wait_steps = int(self.WAIT_AFTER_ACTION / 0.1)
                     for _ in range(wait_steps):
                         time.sleep(0.1)

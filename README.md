@@ -46,15 +46,22 @@ This system implements a **developmental reinforcement learning architecture** f
 - Action execution: **faster, more reliable**
 
 **3. Optimized Timing**
-- `WAIT_AFTER_ACTION`: 3.0s → **1.5s** (50% faster)
+- `WAIT_AFTER_ACTION`: **3.0s** (ensures rolling window fully refreshes with post-action data)
 - `COOLDOWN`: 5.0s → **2.0s** (60% faster)
-- Total cycle time: ~14s → **~3.5-5s** (65-75% faster)
+- Total cycle time: ~14s → **~5s** (64% faster)
 
 **4. Early Exit Logic**
 - Wait loop checks `num_faces` every 0.1s
 - Exits immediately if user leaves (num_faces == 0)
-- Adaptive wait: 0.0-1.5s instead of fixed 1.5s
+- Adaptive wait: 0.0-3.0s instead of fixed 3.0s
 - Prevents wasted measurement time
+
+**Why 3.0s Wait?**
+- Action execution time: ~0.5s
+- Human reaction time: ~1.0s
+- Rolling window refresh: 3.0s (critical!)
+- The 3-second window ensures post-state measurement contains only post-action data
+- Without full refresh, post-state would be contaminated with 50%+ pre-action samples
 
 ---
 
@@ -271,7 +278,7 @@ PROACTIVE_ACTIONS = [
 7. Execute action via native YARP RPC:
    yarp.Bottle → /interactionInterface
 
-8. Wait 1.5 seconds for effect (with early exit if user leaves)
+8. Wait 3.0 seconds for action + reaction + sensor integration (with early exit if user leaves)
 
 9. Capture post-state snapshot (instant from rolling window)
 
@@ -679,7 +686,7 @@ THRESH_VAR = 0.1      # Maximum variance to act
 
 **Timing**:
 ```python
-WAIT_AFTER_ACTION = 1.5          # Seconds to observe effect (with early exit)
+WAIT_AFTER_ACTION = 3.0          # Seconds for action + reaction + rolling window refresh
 COOLDOWN = 2.0                   # Seconds between actions
 SELFADAPTOR_PERIOD_CALM = 240.0  # Self-adaptor: calm (4 min)
 SELFADAPTOR_PERIOD_LIVELY = 120.0  # Self-adaptor: lively (2 min)
