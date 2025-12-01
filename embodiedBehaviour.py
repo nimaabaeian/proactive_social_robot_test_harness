@@ -12,7 +12,6 @@ import signal
 import sys
 from collections import deque
 
-
 class EmbodiedBehaviour(yarp.RFModule):
 
     # Configuration Constants
@@ -26,7 +25,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     THRESH_MEAN = 0.5
     THRESH_VAR = 0.1
     WAIT_AFTER_ACTION = 3.5
-    COOLDOWN = 2.0
+    COOLDOWN = 5.0
     SELFADAPTOR_PERIOD_CALM = 240.0
     SELFADAPTOR_PERIOD_LIVELY = 120.0
     
@@ -37,6 +36,9 @@ class EmbodiedBehaviour(yarp.RFModule):
     NO_FACES_TIMEOUT = 120.0
     WINDOW_SIZE = 60  # Rolling window for state averaging (3s at 20Hz)
     
+    # Data freshness timeouts (detect stale/frozen sensor data)
+    IIE_TIMEOUT = 5.0     
+    INFO_TIMEOUT = 5.0   
     def __init__(self):
         super().__init__()
         
@@ -60,6 +62,10 @@ class EmbodiedBehaviour(yarp.RFModule):
         self.ctx = -1
         self.num_faces = 0
         self.num_mutual_gaze = 0
+        
+        # Data freshness timestamps (detect stale data)
+        self.last_iie_update = 0.0
+        self.last_info_update = 0.0
         
         # Rolling window buffers for non-blocking state averaging
         self.iie_window = deque(maxlen=self.WINDOW_SIZE)
@@ -205,6 +211,7 @@ class EmbodiedBehaviour(yarp.RFModule):
         with self._state_lock:
             self.IIE_mean = mean
             self.IIE_var = var
+            self.last_iie_update = time.time()
 
     def _update_context(self, ctx):
         with self._state_lock:
@@ -214,11 +221,31 @@ class EmbodiedBehaviour(yarp.RFModule):
         with self._state_lock:
             self.num_faces = faces
             self.num_mutual_gaze = mutual_gaze
+            self.last_info_update = time.time()
             
             # Update last faces seen time
             if faces > 0:
                 with self.alwayson_lock:
                     self.last_faces_seen_time = time.time()
+    
+    def _check_data_freshness(self):
+        """Reset stale data to safe defaults (prevents frozen sensor spam)"""
+        current_time = time.time()
+        with self._state_lock:
+            # IIE timeout: reset to low engagement + high variance (blocks actions)
+            if current_time - self.last_iie_update > self.IIE_TIMEOUT:
+                if self.IIE_mean != 0.0 or self.IIE_var != 1.0:
+                    print(f"[DataFreshness] ⚠ IIE stale ({current_time - self.last_iie_update:.1f}s) → reset to safe defaults")
+                    self.IIE_mean = 0.0
+                    self.IIE_var = 1.0
+                    self.iie_window.clear()
+            
+            # Info timeout: reset to no faces (triggers always-on stop)
+            if current_time - self.last_info_update > self.INFO_TIMEOUT:
+                if self.num_faces != 0 or self.num_mutual_gaze != 0:
+                    print(f"[DataFreshness] ⚠ Info stale ({current_time - self.last_info_update:.1f}s) → reset to no faces")
+                    self.num_faces = 0
+                    self.num_mutual_gaze = 0
     
     def _is_alwayson_active(self):
         """Check if always-on is currently active"""
@@ -262,6 +289,7 @@ class EmbodiedBehaviour(yarp.RFModule):
             cmd_bottle.addString(command)
             
             self.port_rpc.write(cmd_bottle, reply_bottle)
+            print(f"[Always-On] ✓ Sent: {command}")
             return True
         except Exception as e:
             print(f"[Always-On] ✗ Error executing '{command}': {e}")
@@ -304,6 +332,9 @@ class EmbodiedBehaviour(yarp.RFModule):
                         
                         if abs(best['mean'] - old_mean) > 0.1:
                             print(f"[IIE] {old_mean:.2f}→{best['mean']:.2f}")
+                
+                # Check for stale data
+                self._check_data_freshness()
                 
                 time.sleep(0.05)
             except Exception as e:
@@ -369,6 +400,9 @@ class EmbodiedBehaviour(yarp.RFModule):
                     self._update_info(faces, mutual_gaze)
                     if old_faces != faces or old_gaze != mutual_gaze:
                         print(f"[INFO] Faces={faces}, Gaze={mutual_gaze}")
+                
+                # Check for stale data
+                self._check_data_freshness()
                 
                 time.sleep(0.5)
             except Exception as e:
@@ -444,7 +478,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                         continue
                     
                     # Get windowed pre-state snapshot (instant, uses rolling buffer)
-                    print(f"[Proactive] 📊 Capturing pre-state (instant from rolling window)...")
+                    print(f"[Proactive] 📊 Capturing pre-state")
                     pre = self._windowed_snapshot()
                     
                     # Check person presence
@@ -501,14 +535,14 @@ class EmbodiedBehaviour(yarp.RFModule):
                         cmd_bottle.addString(action)
                         
                         self.port_rpc.write(cmd_bottle, reply_bottle)
-                        print(f"[Proactive] ✓ Action sent")
+                        print(f"[Proactive] ✓ Action sent: {action}")
                     except Exception as e:
                         print(f"[Proactive] ✗ Error: {e}")
                         continue
                     
                     # Wait for: action completion + human reaction + rolling window to refresh with new data
                     # This ensures post-state measurement doesn't contain pre-action data
-                    print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for action + reaction + sensor integration...")
+                    print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for action + reaction")
                     time.sleep(self.WAIT_AFTER_ACTION)
                     print(f"[Proactive] ✓ Wait completed")
                     
@@ -624,7 +658,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                         cmd_bottle.addString(action)
                         
                         self.port_rpc.write(cmd_bottle, reply_bottle)
-                        print(f"[Self-Adaptor] ✓ Action sent")
+                        print(f"[Self-Adaptor] ✓ Action sent: {action}")
                     except Exception as e:
                         print(f"[Self-Adaptor] ✗ Error: {e}")
                         continue

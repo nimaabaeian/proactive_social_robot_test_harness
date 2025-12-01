@@ -1,0 +1,5 @@
+timestamp,proactive_action,pre_IIE_mean,pre_IIE_var,pre_ctx,pre_num_faces,pre_num_mutual_gaze,post_IIE_mean,post_IIE_var,post_ctx,post_num_faces,post_num_mutual_gaze,q_value,epsilon
+1764611105.50,ao_coffee_break,0.6477,0.0636,0,2,2,0.5926,0.0713,0,2,2,0.0000,0.8000
+1764611143.51,ao_coffee_break,0.5998,0.0705,0,2,2,0.5896,0.0758,0,2,2,-0.0326,0.7661
+1764611198.50,ao_coffee_break,0.6426,0.0552,0,2,2,0.7518,0.0527,1,0,0,-0.0484,0.7336
+1764611238.51,ao_coffee_break,0.6690,0.0468,0,2,2,0.0000,1.0000,0,2,2,0.0066,0.7025

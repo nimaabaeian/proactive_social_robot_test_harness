@@ -1,0 +1,5 @@
+timestamp,proactive_action,pre_IIE_mean,pre_IIE_var,pre_ctx,pre_num_faces,pre_num_mutual_gaze,target_delta_IIE,predicted_delta_IIE,prediction_error,model_training_count
+1764611105.502545,ao_coffee_break,0.6477,0.0636,0,2,2,-0.0551,0.0000,0.0551,1
+1764611143.5052829,ao_coffee_break,0.5998,0.0705,0,2,2,-0.0102,0.0000,0.0102,2
+1764611198.5038633,ao_coffee_break,0.6426,0.0552,0,2,2,0.1092,0.0000,0.1092,3
+1764611238.506883,ao_coffee_break,0.6690,0.0468,0,2,2,-0.6690,0.0000,0.6690,4

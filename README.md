@@ -29,7 +29,8 @@ This system implements a **developmental reinforcement learning architecture** f
 - **Noise-robust**: Filters out measurement jitter with dead zones and rolling window averaging (3s history, 60 samples at 20Hz)
 - **Exploration-exploitation**: Balances trying new things vs. using known strategies
 - **Always-on autonomy**: Auto-stops when no one is present, restarts when people return
-- **High-performance**: Non-blocking state capture (0.0s latency), native YARP RPC, early exit logic
+- **Data freshness monitoring**: Detects and handles stale sensor data to prevent frozen state spam
+- **High-performance**: Non-blocking state capture (0.0s latency), native YARP RPC, fire-and-forget action execution
 
 ### Performance Optimizations
 
@@ -39,13 +40,22 @@ This system implements a **developmental reinforcement learning architecture** f
 - Maintains 3-second noise filtering without wait time
 - Pre/post state capture: **6.0s → 0.0s** (instant)
 
-**2. Native YARP RPC (No Subprocess)**
-- Replaced shell subprocess calls with native `yarp.RpcClient`
+**2. Native YARP RPC (Fire-and-Forget)**
+- Uses native `yarp.RpcClient` for action execution
 - Direct bottle communication to `/interactionInterface`
-- Eliminates shell overhead and process spawning
+- Fire-and-forget pattern: no reply checking needed
 - Action execution: **faster, more reliable**
 
-**3. Optimized Timing**
+**3. Data Freshness Monitoring**
+- Detects stale/frozen sensor streams
+- IIE timeout: 5.0s (expected 20Hz updates)
+- Info timeout: 5.0s (expected 2Hz updates)
+- Auto-resets to safe defaults when data freezes:
+  - IIE → `mean=0.0`, `var=1.0` (blocks actions)
+  - Info → `faces=0`, `gaze=0` (triggers always-on stop)
+- Prevents action spam from frozen sensor values
+
+**4. Optimized Timing**
 - `WAIT_AFTER_ACTION`: **3.5s** (ensures rolling window fully refreshes with post-action data)
 - `COOLDOWN`: 5.0s → **2.0s** (60% faster)
 - Total cycle time: ~14s → **~6s** (57% faster)
@@ -271,7 +281,7 @@ PROACTIVE_ACTIONS = [
    • Epsilon decays: 0.8 → 0.2 over time
 
 7. Execute action via native YARP RPC:
-   yarp.Bottle → /interactionInterface
+   yarp.Bottle → /interactionInterface (fire-and-forget)
 
 8. Wait 3.5 seconds for action + reaction + sensor integration
    → Fixed wait ensures complete rolling window refresh
@@ -701,6 +711,13 @@ EPSILON_DECAY = 0.957603 # Decay per action
 WINDOW_SIZE = 60         # Buffer size (3s at 20Hz)
 # IIE Monitor feeds buffer continuously
 # Snapshot reads instantly from buffer (0.0s latency)
+```
+
+**Data Freshness** (Stale Sensor Detection):
+```python
+IIE_TIMEOUT = 5.0   # Reset to safe defaults after 5s of no updates
+INFO_TIMEOUT = 5.0  # Reset to safe defaults after 5s of no updates
+# Context has no timeout (deliberate state, not continuous stream)
 ```
 
 ### Learning

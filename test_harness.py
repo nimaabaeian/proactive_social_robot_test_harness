@@ -318,12 +318,10 @@ class DynamicEnvironmentSimulator:
                         
                         print(f"\n{'='*70}")
                         print(f"[ACTION #{self.action_count}] {action} @ {datetime.fromtimestamp(timestamp).strftime('%H:%M:%S.%f')[:-3]}")
+                        print(f"[ACTION #{self.action_count}] {action} @ {datetime.fromtimestamp(timestamp).strftime('%H:%M:%S.%f')[:-3]}")
                         print(f"{'='*70}")
                         
-                        # Simple acknowledgment (robot doesn't check response anyway)
-                        reply.addString("ok")
-                        self.port_rpc.reply(reply)
-                        
+                        # No reply needed - fire-and-forget RPC
                         # Trigger reaction
                         if action in reactions:
                             threading.Thread(
@@ -331,9 +329,6 @@ class DynamicEnvironmentSimulator:
                                 args=(action, reactions[action]),
                                 daemon=True
                             ).start()
-                    else:
-                        reply.addString("nack")
-                        self.port_rpc.reply(reply)
             except Exception as e:
                 if self.running:
                     print(f"[RPCServer] Error: {e}")
@@ -576,6 +571,9 @@ class DynamicEnvironmentSimulator:
     
     def run_all_scenarios(self):
         """Run all test scenarios"""
+        print("\n" + "="*80)
+        print("RUNNING ALL TEST SCENARIOS")
+        print("="*80)
         print("\n" + "="*80)
         print("RUNNING ALL TEST SCENARIOS")
         print("="*80)
