@@ -617,7 +617,7 @@ delta_mean = post_IIE_mean - pre_IIE_mean
 if abs(delta_mean) < DELTA_EPS:  # 0.05 dead zone
     delta_mean = 0.0
 ```
-- **Purpose**: Reward increasing interaction intention
+- **Purpose**: Reward increasing engagement
 - **Dead zone**: Filters noise ±0.05
 - **Example**: 0.65 → 0.75 gives +0.10
 
@@ -637,7 +637,7 @@ level_term = post_IIE_mean - THRESH_MEAN  # 0.5 threshold
 if post_IIE_mean < THRESH_MEAN:
     level_term *= 2.0  # Double penalty!
 ```
-- **Purpose**: Maintain interaction intention above threshold
+- **Purpose**: Maintain engagement above threshold
 - **Positive**: Comfortably above 0.5
 - **Negative**: Below 0.5 (2× penalty)
 - **Example**: 
@@ -680,19 +680,19 @@ reward = 0.23 (no change)
 ```
 
 **Reward Philosophy**:
-- **Delta**: Reward improvement in interaction intention
+- **Delta**: Reward improvement
 - **Variance**: Reward stability
-- **Level**: Maintain high interaction intention (don't break interaction!)
+- **Level**: Maintain high engagement (don't break interaction!)
 - **Cost**: Discourage excessive actions
 - **Clipping**: Bound to [-1.0, 1.0] for numerical stability (prevents outliers)
 
 #### 3. Gatekeeper Model (Scene Discriminator)
 
-**Purpose**: Learn to recognize pre-conditions that lead to interaction intention improvement
+**Purpose**: Learn to recognize pre-conditions that lead to engagement improvement
 
 **Philosophy**: 
 - **Learns from RAW OUTCOMES**: Independent of Q-learning reward function
-- **Binary Classification**: Did interaction intention actually increase after this action?
+- **Binary Classification**: Did engagement actually increase after this action?
 - **Physical Reality**: Compares post-IIE vs pre-IIE directly (no weights, no penalties)
 
 **Model**: Binary Classifier
@@ -708,8 +708,8 @@ GradientBoostingClassifier(
 **Input Features** (6D - **PRE-STATE ONLY**):
 ```python
 [
-    pre_IIE_mean,           # Engagement level (before action)
-    pre_IIE_var,            # Stability (before action)  
+    pre_IIE_mean,           # Interaction intention (before action)
+    pre_IIE_var,            # Intention stability (before action)  
     pre_ctx,                # Context (before action)
     pre_num_faces,          # Audience size (before action)
     pre_num_mutual_gaze,    # Attention (before action)
@@ -761,7 +761,16 @@ The gatekeeper learns patterns by observing raw outcomes:
 ```python
 def predict_decision(pre_IIE_mean, pre_IIE_var, pre_ctx, 
                      pre_num_faces, pre_num_mutual_gaze, time_delta):
-    """Returns True (ACT) or False (WAIT)"""
+    """Returns True (ACT) or False (WAIT)
+    
+    Args:
+        pre_IIE_mean: Interaction intention (0-1 scale)
+        pre_IIE_var: Intention variance/stability
+        pre_ctx: Context classification (0=Calm, 1=Lively)
+        pre_num_faces: Number of faces detected
+        pre_num_mutual_gaze: Number of people with mutual gaze
+        time_delta: Seconds since last action
+    """
     features = [pre_IIE_mean, pre_IIE_var, pre_ctx, 
                 pre_num_faces, pre_num_mutual_gaze, time_delta]
     prediction = gate_model.predict([features])[0]
@@ -1341,12 +1350,12 @@ def _check_gatekeeper(self, pre, time_delta):
         # Encode features: MUST MATCH learning.py _encode_gate_features() ORDER EXACTLY
         # [pre_IIE_mean, pre_IIE_var, pre_ctx, pre_num_faces, pre_num_mutual_gaze, time_delta]
         features = np.array([[
-            pre['IIE_mean'],
-            pre['IIE_var'],
-            float(pre['ctx']),
-            float(pre['num_faces']),
-            float(pre['num_mutual_gaze']),
-            float(time_delta)
+            pre['IIE_mean'],               # Interaction intention (pre)
+            pre['IIE_var'],                # Intention stability (pre)
+            float(pre['ctx']),             # Context (pre)
+            float(pre['num_faces']),       # Audience size (pre)
+            float(pre['num_mutual_gaze']), # Attention (pre)
+            float(time_delta)              # Time since last action
         ]])
         
         # Predict: 1 = YES (opportune scene), 0 = NO (wait)
@@ -1475,7 +1484,12 @@ After collecting 200+ training samples and verifying gatekeeper convergence:
 - **CRITICAL**: Both modules must encode features in **identical order**
 - Learning module defines order in `_encode_gate_features()`:
   ```python
-  [pre_IIE_mean, pre_IIE_var, pre_ctx, pre_num_faces, pre_num_mutual_gaze, time_delta]
+  [pre_IIE_mean,           # Interaction intention (pre)
+   pre_IIE_var,            # Intention stability (pre)
+   pre_ctx,                # Context (pre)
+   pre_num_faces,          # Audience size (pre)
+   pre_num_mutual_gaze,    # Attention (pre)
+   time_delta]             # Time since last action
   ```
 - Actor module must match exactly in `_check_gatekeeper()` (see helper method above)
 - Mismatch will cause prediction errors
