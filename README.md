@@ -27,48 +27,47 @@ This system implements a **developmental reinforcement learning architecture** f
 ### Key Features
 - **Real-time learning**: Updates after every interaction
 - **Context-aware**: Adapts behavior to calm vs. lively environments
-- **Noise-robust**: Filters out measurement jitter with dead zones and rolling window averaging (3s history, 60 samples at 20Hz)
+- **Noise-robust**: Filters out measurement jitter with dead zones and blocking windowed snapshots (3s averaging at 0.1s steps)
 - **Exploration-exploitation**: Balances trying new things vs. using known strategies
 - **Always-on autonomy**: Auto-stops when no one is present, restarts when people return
-- **Data freshness monitoring**: Detects and handles stale sensor data to prevent frozen state spam
-- **High-performance**: Non-blocking state capture (0.0s latency), native YARP RPC, fire-and-forget action execution
+- **Self-adaptor behaviors**: Natural background actions (yawn, look around, cough) with proactive priority
+- **Subprocess RPC**: Fire-and-forget action execution via shell commands
 
-### Performance Optimizations
+### Architecture Design
 
-**1. Rolling Window Buffers (Non-Blocking, Thread-Safe)**
-- IIE Monitor continuously populates a 60-sample rolling buffer at 20Hz
-- State snapshots read instantly from buffer (0.0s vs 3.0s blocking)
-- Maintains 3-second noise filtering without wait time
-- Pre/post state capture: **6.0s → 0.0s** (instant)
-- Thread-safe: `_state_lock` protects deque from concurrent append/iteration race conditions
+**1. Blocking Windowed Snapshots**
+- State captured on-demand via `_windowed_snapshot(duration=3.0, step=0.1)`
+- Collects ~30 samples over 3 seconds for noise reduction
+- Pre-state: 3s blocking collection
+- Post-state: 3s blocking collection
+- Total measurement overhead: 6s per action (necessary for stable readings)
 
-**2. Native YARP RPC (Fire-and-Forget)**
-- Uses native `yarp.RpcClient` for action execution
-- Direct bottle communication to `/interactionInterface`
+**2. Subprocess-Based RPC**
+- Uses `subprocess.run('echo "exe {cmd}" | yarp rpc /interactionInterface')`
 - Fire-and-forget pattern: no reply checking needed
-- Action execution: **faster, more reliable**
+- 5-second timeout for command execution
+- Robust error handling and logging
 
-**3. Data Freshness Monitoring**
-- Detects stale/frozen sensor streams
-- IIE timeout: 5.0s (expected 20Hz updates)
-- Info timeout: 5.0s (expected 2Hz updates)
-- Auto-resets to safe defaults when data freezes:
-  - IIE → `mean=0.0`, `var=1.0` (blocks actions)
-  - Info → `faces=0`, `gaze=0` (triggers always-on stop)
-- Prevents action spam from frozen sensor values
+**3. Self-Adaptor Priority System**
+- Self-adaptors execute only when always-on is active
+- Random period between 120-240 seconds per cycle
+- Proactive actions have priority: self-adaptor aborts cycle if proactive starts
+- Aborts only after proactive passes threshold checks and selects action
+- Restarts with new random period after proactive completes
 
 **4. Optimized Timing**
-- `WAIT_AFTER_ACTION`: **3.5s** (ensures rolling window fully refreshes with post-action data)
+- `WAIT_AFTER_ACTION`: **3.0s** (action execution + human reaction time)
 - `COOLDOWN`: **5.0s** (minimum time between proactive actions)
-- Total cycle time: ~9s per action (3.5s wait + 5.0s cooldown + decision overhead)
+- Pre-state collection: **3.0s** (blocking windowed snapshot)
+- Post-state collection: **3.0s** (blocking windowed snapshot)
+- Total cycle time: **~14s per action** (3s pre + 3s wait + 3s post + 5s cooldown)
 
-**Why 3.5s Wait?**
+**Why Blocking Snapshots?**
 - Action execution time: ~0.5s
-- Human reaction time: ~1.0s
-- Rolling window refresh: 3.0s (60 samples at 20Hz)
-- Safety margin: +0.5s for timing jitter
-- The wait ensures post-state measurement contains only post-action data
-- Without full refresh, post-state would be contaminated with 50%+ pre-action samples
+- Human reaction time: ~1.0-2.0s
+- Data collection: 3.0s (30 samples at 0.1s intervals)
+- The blocking approach ensures synchronized measurements
+- Simpler implementation without rolling buffer complexity
 
 ---
 
@@ -503,20 +502,23 @@ SELF_ADAPTORS = [
 ```
 
 **Behavior**:
-- **Context-dependent timing**:
-  - Calm environment: Every 240 seconds (4 minutes)
-  - Lively environment: Every 120 seconds (2 minutes)
+- **Random timing**: Each cycle uses random period between 120-240 seconds
+- **Always-on dependent**: Only executes when always-on is active
+- **Proactive priority**: Aborts cycle if proactive action starts executing
+  - Monitors proactive execution during sleep period
+  - Aborts only after proactive passes thresholds and selects action
+  - Waits for proactive to complete, then restarts with new random period
 - **Random selection**: No learning involved
-- **Always active**: Runs even when always-on is stopped
-- **Purpose**: Make robot seem alive and natural
+- **Purpose**: Make robot seem alive and natural during interactions
 
 **Key Difference from Proactive**:
-- ✗ No threshold checks
+- ✗ No threshold checks (executes regardless of IIE state)
 - ✗ No Q-learning
 - ✗ No epsilon-greedy
 - ✗ No experience sent to Learning
-- ✓ Always runs (even when stopped)
-- ✓ Context-adaptive timing
+- ✓ Respects always-on state (only when active)
+- ✓ Yields to proactive actions (priority system)
+- ✓ Random timing (120-240s per cycle)
 
 ---
 
@@ -884,11 +886,11 @@ THRESH_VAR = 0.1      # Maximum variance to act
 
 **Timing**:
 ```python
-WAIT_AFTER_ACTION = 3.5          # Seconds for action + reaction + rolling window refresh
-COOLDOWN = 5.0                   # Seconds between actions
-SELFADAPTOR_PERIOD_CALM = 240.0  # Self-adaptor: calm (4 min)
-SELFADAPTOR_PERIOD_LIVELY = 120.0  # Self-adaptor: lively (2 min)
+WAIT_AFTER_ACTION = 3.0          # Seconds for action execution + human reaction
+COOLDOWN = 5.0                   # Seconds between proactive actions (hardcoded)
 NO_FACES_TIMEOUT = 120.0         # Always-on: stop after (2 min)
+# Self-adaptor: random period between 120-240s per cycle
+# (Context-dependent timing removed in favor of random periods)
 ```
 
 **Exploration**:
@@ -898,18 +900,21 @@ EPSILON_MIN = 0.2        # Minimum exploration rate
 EPSILON_DECAY = 0.957603 # Decay per action
 ```
 
-**Rolling Window** (Non-Blocking Noise Filtering):
+**Windowed Snapshots** (Blocking On-Demand Collection):
 ```python
-WINDOW_SIZE = 60         # Buffer size (3s at 20Hz)
-# IIE Monitor feeds buffer continuously
-# Snapshot reads instantly from buffer (0.0s latency)
+# _windowed_snapshot(duration=3.0, step=0.1)
+# Collects ~30 samples over 3 seconds for noise filtering
+# Pre-state: 3s blocking collection
+# Post-state: 3s blocking collection
+# Total measurement time: 6s per action cycle
 ```
 
-**Data Freshness** (Stale Sensor Detection):
+**Priority System**:
 ```python
-IIE_TIMEOUT = 5.0   # Reset to safe defaults after 5s of no updates
-INFO_TIMEOUT = 5.0  # Reset to safe defaults after 5s of no updates
-# Context has no timeout (deliberate state, not continuous stream)
+# Proactive thread signals execution state via proactive_active flag
+# Self-adaptor monitors flag during sleep period
+# Aborts cycle only after proactive selects action (not during threshold checks)
+# Restarts with new random period after proactive completes
 ```
 
 ### Learning

@@ -70,6 +70,10 @@ class EmbodiedBehaviour(yarp.RFModule):
         self.alwayson_lock = threading.Lock()
         self.last_faces_seen_time = time.time()
         
+        # Proactive execution state (for self-adaptor priority)
+        self.proactive_active = False
+        self.proactive_lock = threading.Lock()
+        
         # Gatekeeper timing (Phase 3)
         # self.last_action_time = time.time()  # Uncomment for Phase 3: Track time between actions
         
@@ -206,6 +210,16 @@ class EmbodiedBehaviour(yarp.RFModule):
         with self.alwayson_lock:
             return self.alwayson_active
     
+    def _is_proactive_executing(self):
+        """Check if proactive thread is currently executing an action"""
+        with self.proactive_lock:
+            return self.proactive_active
+    
+    def _set_proactive_active(self, active):
+        """Set proactive execution state"""
+        with self.proactive_lock:
+            self.proactive_active = active
+    
     def _windowed_snapshot(self, duration=1.0, step=0.1):
         """Get averaged state snapshot over a time window to reduce noise
         """
@@ -277,8 +291,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                         old_mean = self.IIE_mean
                         self._update_iie(best['mean'], best['variance'])
                         if abs(best['mean'] - old_mean) > 0.1:
-                            print(f"[Actor/IIE] 📊 μ={best['mean']:.2f}, σ²={best['variance']:.2f}")
-                            print(f"[IIE] {old_mean:.2f}→{best['mean']:.2f}")
+                            print(f"[Actor/IIE] 📊 Updated from {len(face_data)} face(s): μ={best['mean']:.2f}, σ²={best['variance']:.2f} (Δ{best['mean']-old_mean:+.2f})")
                 
                 time.sleep(0.05)
             except Exception as e:
@@ -367,18 +380,18 @@ class EmbodiedBehaviour(yarp.RFModule):
                 
                 # Check if we should stop (no faces for 2 minutes)
                 if is_active and snapshot['num_faces'] == 0 and time_since_faces >= self.NO_FACES_TIMEOUT:
-                    print(f"[Actor/AO] ⏸️ No faces {self.NO_FACES_TIMEOUT:.0f}s → stopping")
+                    print(f"[Actor/AO] ⏸️ No faces for {time_since_faces:.0f}s (timeout={self.NO_FACES_TIMEOUT:.0f}s) → executing ao_stop")
                     if self._execute_alwayson_command("ao_stop"):
                         with self.alwayson_lock:
                             self.alwayson_active = False
-                        print("[Actor/AO] ✅ Stopped")                # Check if we should start (faces detected while stopped)
+                        print("[Actor/AO] ✅ Always-on stopped successfully")                # Check if we should start (faces detected while stopped)
                 elif not is_active and snapshot['num_faces'] > 0:
-                    print(f"[Actor/AO] ▶️ Faces detected → starting")
+                    print(f"[Actor/AO] ▶️ Faces detected ({snapshot['num_faces']}) while stopped → executing ao_start")
                     if self._execute_alwayson_command("ao_start"):
                         with self.alwayson_lock:
                             self.alwayson_active = True
                             self.last_faces_seen_time = current_time
-                        print("[Actor/AO] ✅ Started")
+                        print("[Actor/AO] ✅ Always-on started successfully")
                 
                 time.sleep(1.0)
             except Exception as e:
@@ -425,22 +438,22 @@ class EmbodiedBehaviour(yarp.RFModule):
                         continue
                     
                     if pre['num_mutual_gaze'] == 0:
-                        print(f"[Actor/PRO] ⏸️ No gaze (faces={pre['num_faces']})")
+                        print(f"[Actor/PRO] ⏸️ Waiting for gaze: faces={pre['num_faces']}, gaze=0 (need >0)")
                         time.sleep(1.0)
                         continue
                     
                     # Check intention thresholds
                     if pre['IIE_mean'] < self.THRESH_MEAN:
-                        print(f"[Actor/PRO] ⏸️ Low IIE: μ={pre['IIE_mean']:.2f}<{self.THRESH_MEAN}")
+                        print(f"[Actor/PRO] ⏸️ IIE too low: μ={pre['IIE_mean']:.2f} < threshold={self.THRESH_MEAN}")
                         time.sleep(2.0)
                         continue
                     
                     if pre['IIE_var'] >= self.THRESH_VAR:
-                        print(f"[Actor/PRO] ⏸️ Unstable: σ²={pre['IIE_var']:.2f}≥{self.THRESH_VAR}")
+                        print(f"[Actor/PRO] ⏸️ IIE unstable: σ²={pre['IIE_var']:.2f} ≥ threshold={self.THRESH_VAR}")
                         time.sleep(2.0)
                         continue
                     
-                    print(f"[Actor/PRO] ✅ Thresholds: μ={pre['IIE_mean']:.2f}, σ²={pre['IIE_var']:.2f}")
+                    print(f"[Actor/PRO] ✅ All checks passed: μ={pre['IIE_mean']:.2f}, σ²={pre['IIE_var']:.2f}, faces={pre['num_faces']}, gaze={pre['num_mutual_gaze']}")
                     
                     # ============================================================
                     # TODO: GATEKEEPER INTEGRATION (PHASE 3+)
@@ -477,10 +490,13 @@ class EmbodiedBehaviour(yarp.RFModule):
                     state_key = f"CTX{pre['ctx']}"
                     action = self._select_action_epsilon_greedy(state_key)
                     
+                    # Signal self-adaptor that proactive action is starting (AFTER action selection)
+                    self._set_proactive_active(True)
+                    
                     with self.qtable_lock:
                         q_value = self.Q.get(state_key, {}).get(action, 0.0)
                     
-                    print(f"[Actor/PRO] ⚡ {action} | CTX{pre['ctx']} μ={pre['IIE_mean']:.2f} Q={q_value:.2f} ε={self.epsilon:.2f}")
+                    print(f"[Actor/PRO] ⚡ Executing: {action} | CTX{pre['ctx']} | Q={q_value:.2f} | ε={self.epsilon:.2f}")
                     
                     # Execute via RPC shell command
                     try:
@@ -492,23 +508,29 @@ class EmbodiedBehaviour(yarp.RFModule):
                             timeout=5
                         )
                         if result.returncode != 0:
-                            print(f"[Actor/PRO] ❌ RPC: {result.stderr.strip()}")
+                            print(f"[Actor/PRO] ❌ RPC failed: {result.stderr.strip()}")
+                            self._set_proactive_active(False)
                             continue
                     except subprocess.TimeoutExpired:
-                        print(f"[Actor/PRO] ❌ Timeout")
+                        print(f"[Actor/PRO] ❌ RPC timeout (>5s)")
+                        self._set_proactive_active(False)
                         continue
                     except Exception as e:
-                        print(f"[Actor/PRO] ❌ {e}")
+                        print(f"[Actor/PRO] ❌ RPC error: {e}")
+                        self._set_proactive_active(False)
                         continue
                     
                     # Wait for effect
+                    print(f"[Actor/PRO] ⏳ Waiting {self.WAIT_AFTER_ACTION:.1f}s for action effect...")
                     time.sleep(self.WAIT_AFTER_ACTION)
                     
                     # Get windowed post-state snapshot (averaged over 3 seconds)
+                    print(f"[Actor/PRO] 📸 Collecting post-state (3s window)...")
                     post = self._windowed_snapshot(duration=3.0, step=0.1)
                     
                     delta_iie = post['IIE_mean'] - pre['IIE_mean']
-                    print(f"[Actor/PRO] 📊 Result: μ {pre['IIE_mean']:.2f}→{post['IIE_mean']:.2f} ({delta_iie:+.2f})")
+                    delta_var = post['IIE_var'] - pre['IIE_var']
+                    print(f"[Actor/PRO] 📊 Outcome: μ {pre['IIE_mean']:.2f}→{post['IIE_mean']:.2f} ({delta_iie:+.2f}), σ² {pre['IIE_var']:.2f}→{post['IIE_var']:.2f} ({delta_var:+.2f})")
                     
                     # Send experience to learning module (13 fields)
                     bottle = self.port_learning.prepare()
@@ -546,6 +568,9 @@ class EmbodiedBehaviour(yarp.RFModule):
                     if abs(old_eps - self.epsilon) > 0.01:
                         print(f"[Actor/PRO] 🎲 ε: {self.epsilon:.2f}")
                     
+                    # Signal self-adaptor that proactive action is complete
+                    self._set_proactive_active(False)
+                    
                     time.sleep(5.0)
                     
                 except Exception as e:
@@ -562,9 +587,9 @@ class EmbodiedBehaviour(yarp.RFModule):
     def _selfadaptor_loop(self):
         """Execute periodic self-regulation behaviors
         
-        NOTE: Self-adaptors execute regardless of always-on state.
-        They represent natural background behaviors that continue even when
-        the system is not actively engaging
+        NOTE: Self-adaptors only execute when always-on is active.
+        They represent natural background behaviors during active engagement.
+        Proactive actions have priority - self-adaptor cycle aborts if proactive starts.
         """
         print("[Actor/SA] ▶️ Self-adaptor thread started")
         
@@ -583,29 +608,49 @@ class EmbodiedBehaviour(yarp.RFModule):
             
             while self.running:
                 try:
-                    # Context-dependent period (uncertain defaults to calm for conservative timing)
-                    snapshot = self._get_state_snapshot()
-                    if snapshot['ctx'] == 1:
-                        period = self.SELFADAPTOR_PERIOD_LIVELY
-                    else:  # ctx == 0 or ctx == -1 (uncertain)
-                        period = self.SELFADAPTOR_PERIOD_CALM
+                    # Random period between 120-240 seconds
+                    period = random.uniform(120.0, 240.0)
+                    print(f"[Actor/SA] ⏱️ Waiting {period:.1f}s until next self-adaptor...")
                     
-                    # Interruptible sleep for responsive shutdown
+                    # Interruptible sleep with proactive priority
                     sleep_step = 0.5
                     elapsed = 0.0
                     while self.running and elapsed < period:
+                        # Check if proactive thread started executing
+                        if self._is_proactive_executing():
+                            print(f"[Actor/SA] ⏸️ Cycle aborted at {elapsed:.1f}s/{period:.1f}s (proactive action executing)")
+                            # Wait for proactive to finish
+                            while self.running and self._is_proactive_executing():
+                                time.sleep(0.5)
+                            # Restart period after proactive completes
+                            new_period = random.uniform(120.0, 240.0)
+                            print(f"[Actor/SA] 🔄 Proactive done, restarting with new period: {new_period:.1f}s")
+                            period = new_period
+                            elapsed = 0.0
+                            continue
+                        
                         time.sleep(sleep_step)
                         elapsed += sleep_step
                     
                     if not self.running:
                         break
                     
+                    # Check if always-on is active before executing
+                    if not self._is_alwayson_active():
+                        print(f"[Actor/SA] ⏸️ Skipping: always-on is inactive (system stopped)")
+                        continue
+                    
+                    # Final check: proactive might have started during last sleep
+                    if self._is_proactive_executing():
+                        print(f"[Actor/SA] ⏸️ Skipping: proactive action just started")
+                        continue
+                    
                     # Execute self-adaptor
                     timestamp = time.time()
                     pre = self._get_state_snapshot()
                     action = random.choice(self.SELF_ADAPTORS)
                     
-                    print(f"[Actor/SA] 🔄 {action}")
+                    print(f"[Actor/SA] 🔄 Executing self-adaptor: {action} (μ={pre['IIE_mean']:.2f}, CTX{pre['ctx']})")
                     
                     # Execute via RPC shell command
                     try:
@@ -623,8 +668,12 @@ class EmbodiedBehaviour(yarp.RFModule):
                         print(f"[Actor/SA] ❌ {e}")
                         continue
                     
+                    print(f"[Actor/SA] ⏳ Waiting {self.WAIT_AFTER_ACTION:.1f}s...")
                     time.sleep(self.WAIT_AFTER_ACTION)
                     post = self._get_state_snapshot()
+                    
+                    delta_iie = post['IIE_mean'] - pre['IIE_mean']
+                    print(f"[Actor/SA] ✅ Completed: μ {pre['IIE_mean']:.2f}→{post['IIE_mean']:.2f} ({delta_iie:+.2f})")
                     
                     # Log to CSV
                     csv_writer.writerow([
