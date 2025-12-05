@@ -10,7 +10,10 @@ import random
 import threading
 import signal
 import sys
-from collections import deque
+import subprocess
+import pickle
+import numpy as np
+
 
 class EmbodiedBehaviour(yarp.RFModule):
 
@@ -24,8 +27,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     
     THRESH_MEAN = 0.5
     THRESH_VAR = 0.1
-    WAIT_AFTER_ACTION = 3.5
-    COOLDOWN = 5.0
+    WAIT_AFTER_ACTION = 3.0
     SELFADAPTOR_PERIOD_CALM = 240.0
     SELFADAPTOR_PERIOD_LIVELY = 120.0
     
@@ -34,11 +36,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     EPSILON_DECAY = 0.957603
     
     NO_FACES_TIMEOUT = 120.0
-    WINDOW_SIZE = 60  # Rolling window for state averaging (3s at 20Hz)
     
-    # Data freshness timeouts (detect stale/frozen sensor data)
-    IIE_TIMEOUT = 5.0     
-    INFO_TIMEOUT = 5.0   
     def __init__(self):
         super().__init__()
         
@@ -53,7 +51,6 @@ class EmbodiedBehaviour(yarp.RFModule):
         self.port_context = yarp.BufferedPortBottle()
         self.port_info = yarp.BufferedPortBottle()
         self.port_learning = yarp.BufferedPortBottle()
-        self.port_rpc = yarp.RpcClient()
         
         # Shared state (thread-safe)
         self._state_lock = threading.Lock()
@@ -62,13 +59,6 @@ class EmbodiedBehaviour(yarp.RFModule):
         self.ctx = -1
         self.num_faces = 0
         self.num_mutual_gaze = 0
-        
-        # Data freshness timestamps (detect stale data)
-        self.last_iie_update = 0.0
-        self.last_info_update = 0.0
-        
-        # Rolling window buffers for non-blocking state averaging
-        self.iie_window = deque(maxlen=self.WINDOW_SIZE)
         
         # Q-table and epsilon
         self.Q = {}
@@ -79,6 +69,9 @@ class EmbodiedBehaviour(yarp.RFModule):
         self.alwayson_active = False
         self.alwayson_lock = threading.Lock()
         self.last_faces_seen_time = time.time()
+        
+        # Gatekeeper timing (Phase 3)
+        # self.last_action_time = time.time()  # Uncomment for Phase 3: Track time between actions
         
         # Thread control
         self.running = False
@@ -91,7 +84,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     def configure(self, rf):
         """Initialize module and start all threads"""
         print("\n" + "="*70)
-        print("EMBODIED BEHAVIOUR MODULE - Single Unit Architecture")
+        print("[Actor] 🤖 EMBODIED BEHAVIOUR MODULE")
         print("="*70)
         
         # Open ports
@@ -99,20 +92,15 @@ class EmbodiedBehaviour(yarp.RFModule):
             (self.port_iie, "/alwayson/embodiedbehaviour/iie:i"),
             (self.port_context, "/alwayson/embodiedbehaviour/context:i"),
             (self.port_info, "/alwayson/embodiedbehaviour/info:i"),
-            (self.port_learning, "/alwayson/embodiedbehaviour/experiences:o"),
-            (self.port_rpc, "/alwayson/embodiedbehaviour/rpc:o")
+            (self.port_learning, "/alwayson/embodiedbehaviour/experiences:o")
         ]
         
         for port, name in ports:
             if not port.open(name):
-                print(f"[ERROR] Failed to open {name}")
+                print(f"[Actor] ❌ Port failed: {name}")
                 return False
         
-        # Connect RPC port to interaction interface
-        if not yarp.Network.connect("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
-            print("[WARNING] Could not connect to /interactionInterface, will retry dynamically")
-        
-        print("\n[Ports] All opened successfully")
+        print("[Actor] ✅ Ports ready")
         
         # Initialize CSV files
         self._init_csv_files()
@@ -121,12 +109,11 @@ class EmbodiedBehaviour(yarp.RFModule):
         self._load_qtable()
         
         # Start Always-On
-        print("\n[Always-On] Starting...")
         self._execute_alwayson_command("ao_start")
         with self.alwayson_lock:
             self.alwayson_active = True
             self.last_faces_seen_time = time.time()
-        print("[Always-On] ✓ Active")
+        print("[Actor] ✅ Always-On active")
         
         # Start threads
         self.running = True
@@ -142,20 +129,8 @@ class EmbodiedBehaviour(yarp.RFModule):
         for thread in self.threads:
             thread.start()
         
-        print(f"\n[Threads] Started 6 monitoring and action threads")
-        print(f"  • IIE: Monitors intention (mean, variance)")
-        print(f"  • Context: Monitors calm/lively classification")
-        print(f"  • Info: Monitors face count & mutual gaze")
-        print(f"  • Always-On Monitor: Auto stop/start based on face presence")
-        print(f"  • Proactive: Executes learned social actions")
-        print(f"  • Self-Adaptor: Periodic self-regulation behaviors")
-        print(f"\n[Config] Action Thresholds:")
-        print(f"  • IIE Mean ≥ {self.THRESH_MEAN} (high intention)")
-        print(f"  • IIE Variance < {self.THRESH_VAR} (stable/predictable)")
-        print(f"  • Epsilon: {self.epsilon:.3f} (exploration rate)")
-        print(f"\n[Actions] Available:")
-        print(f"  • Proactive: {', '.join(self.PROACTIVE_ACTIONS)}")
-        print(f"  • Self-Adaptors: {', '.join(self.SELF_ADAPTORS)}")
+        print(f"[Actor] ✅ 6 threads started")
+        print(f"[Actor] 📊 Thresholds: μ≥{self.THRESH_MEAN}, σ²<{self.THRESH_VAR}, ε={self.epsilon:.2f}")
         print("="*70 + "\n")
         
         return True
@@ -171,13 +146,13 @@ class EmbodiedBehaviour(yarp.RFModule):
         """Stop all threads"""
         self.running = False
         for port in [self.port_iie, self.port_context, self.port_info, 
-                     self.port_learning, self.port_rpc]:
+                     self.port_learning]:
             port.interrupt()
         return True
     
     def close(self):
         """Cleanup"""
-        print("\n[Shutdown] Closing embodied behaviour module...")
+        print("\n[Actor] 🛑 Shutting down...")
         self.running = False
         
         # Wait for threads
@@ -186,10 +161,10 @@ class EmbodiedBehaviour(yarp.RFModule):
         
         # Close ports
         for port in [self.port_iie, self.port_context, self.port_info,
-                     self.port_learning, self.port_rpc]:
+                     self.port_learning]:
             port.close()
         
-        print("[Shutdown] Complete")
+        print("[Actor] ✅ Shutdown complete")
         return True
     
     # ========================================================================
@@ -211,7 +186,6 @@ class EmbodiedBehaviour(yarp.RFModule):
         with self._state_lock:
             self.IIE_mean = mean
             self.IIE_var = var
-            self.last_iie_update = time.time()
 
     def _update_context(self, ctx):
         with self._state_lock:
@@ -221,80 +195,54 @@ class EmbodiedBehaviour(yarp.RFModule):
         with self._state_lock:
             self.num_faces = faces
             self.num_mutual_gaze = mutual_gaze
-            self.last_info_update = time.time()
             
             # Update last faces seen time
             if faces > 0:
                 with self.alwayson_lock:
                     self.last_faces_seen_time = time.time()
     
-    def _check_data_freshness(self):
-        """Reset stale data to safe defaults (prevents frozen sensor spam)"""
-        current_time = time.time()
-        with self._state_lock:
-            # IIE timeout: reset to low engagement + high variance (blocks actions)
-            if current_time - self.last_iie_update > self.IIE_TIMEOUT:
-                if self.IIE_mean != 0.0 or self.IIE_var != 1.0:
-                    print(f"[DataFreshness] ⚠ IIE stale ({current_time - self.last_iie_update:.1f}s) → reset to safe defaults")
-                    self.IIE_mean = 0.0
-                    self.IIE_var = 1.0
-                    self.iie_window.clear()
-            
-            # Info timeout: reset to no faces (triggers always-on stop)
-            if current_time - self.last_info_update > self.INFO_TIMEOUT:
-                if self.num_faces != 0 or self.num_mutual_gaze != 0:
-                    print(f"[DataFreshness] ⚠ Info stale ({current_time - self.last_info_update:.1f}s) → reset to no faces")
-                    self.num_faces = 0
-                    self.num_mutual_gaze = 0
-    
     def _is_alwayson_active(self):
         """Check if always-on is currently active"""
         with self.alwayson_lock:
             return self.alwayson_active
     
-    def _windowed_snapshot(self):
-        # Get current instantaneous state for non-IIE fields
-        current = self._get_state_snapshot()
+    def _windowed_snapshot(self, duration=1.0, step=0.1):
+        """Get averaged state snapshot over a time window to reduce noise
+        """
+        samples = []
+        t0 = time.time()
+        while time.time() - t0 < duration and self.running:
+            samples.append(self._get_state_snapshot())
+            time.sleep(step)
         
-        # Create thread-safe copy of rolling window
-        with self._state_lock:
-            window_copy = list(self.iie_window)
+        # Fallback to single snapshot if no samples collected
+        if not samples:
+            return self._get_state_snapshot()
         
-        # If window is empty or too small, return current state
-        if len(window_copy) < 5:
-            return current
-        
-        # Average IIE values from rolling window copy (safe to iterate)
-        iie_means = [sample['mean'] for sample in window_copy]
-        iie_vars = [sample['var'] for sample in window_copy]
-        
+        # Average numeric fields
         return {
-            'IIE_mean': sum(iie_means) / len(iie_means),
-            'IIE_var': sum(iie_vars) / len(iie_vars),
-            'ctx': current['ctx'],
-            'num_faces': current['num_faces'],
-            'num_mutual_gaze': current['num_mutual_gaze']
+            'IIE_mean': sum(s['IIE_mean'] for s in samples) / len(samples),
+            'IIE_var': sum(s['IIE_var'] for s in samples) / len(samples),
+            'ctx': max(set(s['ctx'] for s in samples), key=[s['ctx'] for s in samples].count),
+            'num_faces': round(sum(s['num_faces'] for s in samples) / len(samples)),
+            'num_mutual_gaze': round(sum(s['num_mutual_gaze'] for s in samples) / len(samples)),
         }
     
     def _execute_alwayson_command(self, command):
-        """Execute always-on start/stop command via native YARP RPC"""
+        """Execute always-on start/stop command"""
         try:
-            # Ensure connection to /interactionInterface
-            if not yarp.Network.isConnected("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
-                if yarp.Network.exists("/interactionInterface"):
-                    yarp.Network.connect("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface")
-                    time.sleep(0.1)  # Brief delay for connection to stabilize
-            
-            cmd_bottle = yarp.Bottle()
-            reply_bottle = yarp.Bottle()
-            
-            cmd_bottle.clear()
-            cmd_bottle.addString("exe")
-            cmd_bottle.addString(command)
-            
-            self.port_rpc.write(cmd_bottle, reply_bottle)
-            print(f"[Always-On] ✓ Sent: {command}")
-            return True
+            result = subprocess.run(
+                f'echo "exe {command}" | yarp rpc /interactionInterface',
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return True
+            else:
+                print(f"[Always-On] ✗ Command '{command}' failed: {result.stderr.strip()}")
+                return False
         except Exception as e:
             print(f"[Always-On] ✗ Error executing '{command}': {e}")
             return False
@@ -305,7 +253,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     
     def _iie_monitor_loop(self):
         """Monitor IIE (Interaction Intention Estimation)"""
-        print("[IIE Monitor] Started")
+        print("[Actor/IIE] ▶️ Monitor started")
         
         while self.running:
             try:
@@ -327,30 +275,21 @@ class EmbodiedBehaviour(yarp.RFModule):
                     if face_data:
                         best = max(face_data, key=lambda x: x['mean'])
                         old_mean = self.IIE_mean
-                        
-                        # Update instantaneous state AND rolling window atomically
-                        with self._state_lock:
-                            self.IIE_mean = best['mean']
-                            self.IIE_var = best['variance']
-                            self.last_iie_update = time.time()
-                            self.iie_window.append({'mean': best['mean'], 'var': best['variance']})
-                        
+                        self._update_iie(best['mean'], best['variance'])
                         if abs(best['mean'] - old_mean) > 0.1:
+                            print(f"[Actor/IIE] 📊 μ={best['mean']:.2f}, σ²={best['variance']:.2f}")
                             print(f"[IIE] {old_mean:.2f}→{best['mean']:.2f}")
-                
-                # Check for stale data
-                self._check_data_freshness()
                 
                 time.sleep(0.05)
             except Exception as e:
-                print(f"[IIE Monitor] Error: {e}")
+                print(f"[Actor/IIE] ❌ {e}")
                 time.sleep(1.0)
         
-        print("[IIE Monitor] Stopped")
+        print("[Actor/IIE] ⏹️ Stopped")
 
     def _context_monitor_loop(self):
         """Monitor context classification"""
-        print("[Context Monitor] Started")
+        print("[Actor/CTX] ▶️ Monitor started")
         
         while self.running:
             try:
@@ -360,19 +299,19 @@ class EmbodiedBehaviour(yarp.RFModule):
                     old_ctx = self.ctx
                     self._update_context(label)
                     if old_ctx != label:
-                        ctx_name = "Calm" if label == 0 else "Lively" if label == 1 else "Uncertain"
-                        print(f"[CTX] {old_ctx}→{label} ({ctx_name})")
+                        ctx_name = "🔵Calm" if label == 0 else "🔴Lively" if label == 1 else "⚪Uncertain"
+                        print(f"[Actor/CTX] {ctx_name}")
                 
                 time.sleep(0.1)
             except Exception as e:
-                print(f"[Context Monitor] Error: {e}")
+                print(f"[Actor/CTX] ❌ {e}")
                 time.sleep(1.0)
         
-        print("[Context Monitor] Stopped")
+        print("[Actor/CTX] ⏹️ Stopped")
 
     def _info_monitor_loop(self):
         """Monitor faces and mutual gaze"""
-        print("[Info Monitor] Started")
+        print("[Actor/INFO] ▶️ Monitor started")
         
         while self.running:
             try:
@@ -404,21 +343,18 @@ class EmbodiedBehaviour(yarp.RFModule):
                     old_faces, old_gaze = self.num_faces, self.num_mutual_gaze
                     self._update_info(faces, mutual_gaze)
                     if old_faces != faces or old_gaze != mutual_gaze:
-                        print(f"[INFO] Faces={faces}, Gaze={mutual_gaze}")
-                
-                # Check for stale data
-                self._check_data_freshness()
+                        print(f"[Actor/INFO] 👤{faces} 👁️{mutual_gaze}")
                 
                 time.sleep(0.5)
             except Exception as e:
-                print(f"[Info Monitor] Error: {e}")
+                print(f"[Actor/INFO] ❌ {e}")
                 time.sleep(1.0)
         
-        print("[Info Monitor] Stopped")
+        print("[Actor/INFO] ⏹️ Stopped")
 
     def _alwayson_monitor_loop(self):
         """Monitor face presence and auto-stop/start always-on"""
-        print("[Always-On Monitor] Started")
+        print("[Actor/AO] ▶️ Monitor started")
         
         while self.running:
             try:
@@ -431,27 +367,25 @@ class EmbodiedBehaviour(yarp.RFModule):
                 
                 # Check if we should stop (no faces for 2 minutes)
                 if is_active and snapshot['num_faces'] == 0 and time_since_faces >= self.NO_FACES_TIMEOUT:
-                    print(f"\n[Always-On Monitor] ⏸ No faces for {self.NO_FACES_TIMEOUT:.0f}s, stopping...")
+                    print(f"[Actor/AO] ⏸️ No faces {self.NO_FACES_TIMEOUT:.0f}s → stopping")
                     if self._execute_alwayson_command("ao_stop"):
                         with self.alwayson_lock:
                             self.alwayson_active = False
-                        print("[Always-On Monitor] ✓ Stopped\n")
-                
-                # Check if we should start (faces detected while stopped)
+                        print("[Actor/AO] ✅ Stopped")                # Check if we should start (faces detected while stopped)
                 elif not is_active and snapshot['num_faces'] > 0:
                     print(f"\n[Always-On Monitor] ▶ Faces detected, starting...")
                     if self._execute_alwayson_command("ao_start"):
                         with self.alwayson_lock:
                             self.alwayson_active = True
                             self.last_faces_seen_time = current_time
-                        print("[Always-On Monitor] ✓ Started\n")
+                        print("[Actor/AO] ✅ Started")
                 
                 time.sleep(1.0)
             except Exception as e:
-                print(f"[Always-On Monitor] Error: {e}")
+                print(f"[Actor/AO] ❌ {e}")
                 time.sleep(1.0)
         
-        print("[Always-On Monitor] Stopped")
+        print("[Actor/AO] ⏹️ Stopped")
 
     # ========================================================================
     # Action Threads
@@ -459,7 +393,7 @@ class EmbodiedBehaviour(yarp.RFModule):
     
     def _proactive_loop(self):
         """Execute proactive actions with learning"""
-        print("[Proactive Thread] Started")
+        print("[Actor/PRO] ▶️ Proactive thread started")
         
         csv_file = None
         try:
@@ -482,9 +416,8 @@ class EmbodiedBehaviour(yarp.RFModule):
                         time.sleep(1.0)
                         continue
                     
-                    # Get windowed pre-state snapshot (instant, uses rolling buffer)
-                    print(f"[Proactive] 📊 Capturing pre-state")
-                    pre = self._windowed_snapshot()
+                    # Get windowed pre-state snapshot (averaged over 3 seconds)
+                    pre = self._windowed_snapshot(duration=3.0, step=0.1)
                     
                     # Check person presence
                     if pre['num_faces'] == 0:
@@ -492,22 +425,49 @@ class EmbodiedBehaviour(yarp.RFModule):
                         continue
                     
                     if pre['num_mutual_gaze'] == 0:
-                        print(f"[Proactive] ⏸ No mutual gaze (faces={pre['num_faces']})")
+                        print(f"[Actor/PRO] ⏸️ No gaze (faces={pre['num_faces']})")
                         time.sleep(1.0)
                         continue
                     
                     # Check intention thresholds
                     if pre['IIE_mean'] < self.THRESH_MEAN:
-                        print(f"[Proactive] ⏸ Low intention: μ={pre['IIE_mean']:.2f} < {self.THRESH_MEAN}")
+                        print(f"[Actor/PRO] ⏸️ Low IIE: μ={pre['IIE_mean']:.2f}<{self.THRESH_MEAN}")
                         time.sleep(2.0)
                         continue
                     
                     if pre['IIE_var'] >= self.THRESH_VAR:
-                        print(f"[Proactive] ⏸ Unstable: σ²={pre['IIE_var']:.2f} ≥ {self.THRESH_VAR}")
+                        print(f"[Actor/PRO] ⏸️ Unstable: σ²={pre['IIE_var']:.2f}≥{self.THRESH_VAR}")
                         time.sleep(2.0)
                         continue
                     
-                    print(f"[Proactive] ✓ Thresholds met (averaged): μ={pre['IIE_mean']:.2f}, σ²={pre['IIE_var']:.2f}")
+                    print(f"[Actor/PRO] ✅ Thresholds: μ={pre['IIE_mean']:.2f}, σ²={pre['IIE_var']:.2f}")
+                    
+                    # ============================================================
+                    # TODO: GATEKEEPER INTEGRATION (PHASE 3+)
+                    # ============================================================
+                    # Uncomment this block after 200+ training samples collected
+                    # Requires: pickle, numpy imports (see top of file)
+                    # Requires: self.last_action_time tracking (see __init__)
+                    # ============================================================
+                    #
+                    # # Calculate time since last action
+                    # current_time = time.time()
+                    # time_delta = current_time - getattr(self, 'last_action_time', current_time - 10.0)
+                    # time_delta = min(time_delta, 60.0)  # Clamp to 60s max (prevent outliers after long idle)
+                    # 
+                    # # Query disk-based gatekeeper model
+                    # should_act = self._check_gatekeeper(pre, time_delta)
+                    # 
+                    # if not should_act:
+                    #     print(f"[Actor/PRO] 🚫 Scene not opportune ({time_delta:.0f}s ago)")
+                    #     time.sleep(2.0)
+                    #     continue
+                    # 
+                    # print(f"[Actor/PRO] ✅ Scene opportune")
+                    # 
+                    # # Update timestamp for next action
+                    # self.last_action_time = time.time()
+                    # ============================================================
                     
                     # Load latest Q-table before action selection
                     self._load_qtable(verbose=False)
@@ -520,44 +480,35 @@ class EmbodiedBehaviour(yarp.RFModule):
                     with self.qtable_lock:
                         q_value = self.Q.get(state_key, {}).get(action, 0.0)
                     
-                    print(f"\n[ACT] {action} | CTX{pre['ctx']} IIE={pre['IIE_mean']:.2f} Q={q_value:.2f} ε={self.epsilon:.2f}")
+                    print(f"[Actor/PRO] ⚡ {action} | CTX{pre['ctx']} μ={pre['IIE_mean']:.2f} Q={q_value:.2f} ε={self.epsilon:.2f}")
                     
-                    # Execute via native YARP RPC
+                    # Execute via RPC shell command
                     try:
-                        # Ensure connection to /interactionInterface
-                        if not yarp.Network.isConnected("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
-                            print(f"[Proactive] Connecting to /interactionInterface...")
-                            if not yarp.Network.connect("/alwayson/embodiedbehaviour/rpc:o", "/interactionInterface"):
-                                print(f"[Proactive] ✗ Could not connect to /interactionInterface")
-                                time.sleep(1.0)
-                                continue
-                        
-                        cmd_bottle = yarp.Bottle()
-                        reply_bottle = yarp.Bottle()
-                        
-                        cmd_bottle.clear()
-                        cmd_bottle.addString("exe")
-                        cmd_bottle.addString(action)
-                        
-                        self.port_rpc.write(cmd_bottle, reply_bottle)
-                        print(f"[Proactive] ✓ Action sent: {action}")
+                        result = subprocess.run(
+                            f'echo "exe {action}" | yarp rpc /interactionInterface',
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if result.returncode != 0:
+                            print(f"[Actor/PRO] ❌ RPC: {result.stderr.strip()}")
+                            continue
+                    except subprocess.TimeoutExpired:
+                        print(f"[Actor/PRO] ❌ Timeout")
+                        continue
                     except Exception as e:
-                        print(f"[Proactive] ✗ Error: {e}")
+                        print(f"[Actor/PRO] ❌ {e}")
                         continue
                     
-                    # Wait for: action completion + human reaction + rolling window to refresh with new data
-                    # This ensures post-state measurement doesn't contain pre-action data
-                    print(f"[Proactive] ⏳ Waiting {self.WAIT_AFTER_ACTION}s for action + reaction")
+                    # Wait for effect
                     time.sleep(self.WAIT_AFTER_ACTION)
-                    print(f"[Proactive] ✓ Wait completed")
                     
-                    # Get windowed post-state snapshot (instant, uses rolling buffer)
-                    print(f"[Proactive] 📊 Capturing post-state (instant from rolling window)...")
-                    post = self._windowed_snapshot()
-                    print(f"[Proactive] 📊 Post-state averaged: μ={post['IIE_mean']:.2f}, σ²={post['IIE_var']:.2f}, CTX={post['ctx']}")
+                    # Get windowed post-state snapshot (averaged over 3 seconds)
+                    post = self._windowed_snapshot(duration=3.0, step=0.1)
                     
                     delta_iie = post['IIE_mean'] - pre['IIE_mean']
-                    print(f"→ IIE {pre['IIE_mean']:.2f}→{post['IIE_mean']:.2f} ({delta_iie:+.2f}) CTX{pre['ctx']}→{post['ctx']}")
+                    print(f"[Actor/PRO] 📊 Result: μ {pre['IIE_mean']:.2f}→{post['IIE_mean']:.2f} ({delta_iie:+.2f})")
                     
                     # Send experience to learning module (13 fields)
                     bottle = self.port_learning.prepare()
@@ -576,7 +527,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                     bottle.addInt32(post['num_faces'])
                     bottle.addInt32(post['num_mutual_gaze'])
                     self.port_learning.write()
-                    print(f"[Proactive] 📤 Experience sent to learning module")
+                    print(f"[Actor/PRO] 📤 Sent to Learner")
                     
                     # Log to CSV
                     csv_writer.writerow([
@@ -592,25 +543,30 @@ class EmbodiedBehaviour(yarp.RFModule):
                     # Decay epsilon
                     old_eps = self.epsilon
                     self.epsilon = max(self.EPSILON_MIN, self.epsilon * self.EPSILON_DECAY)
-                    if abs(old_eps - self.epsilon) > 0.001:
-                        print(f"[Proactive] 📉 Epsilon decayed: {old_eps:.3f} → {self.epsilon:.3f}")
+                    if abs(old_eps - self.epsilon) > 0.01:
+                        print(f"[Actor/PRO] 🎲 ε: {self.epsilon:.2f}")
                     
-                    print(f"[Proactive] 😴 Cooldown {self.COOLDOWN}s...\n")
-                    time.sleep(self.COOLDOWN)
+                    time.sleep(5.0)
                     
                 except Exception as e:
-                    print(f"[Proactive Thread] Error: {e}")
+                    print(f"[Actor/PRO] ❌ {e}")
                     time.sleep(1.0)
         except Exception as e:
-            print(f"[Proactive Thread] Fatal error: {e}")
+            print(f"[Actor/PRO] ❌ Fatal: {e}")
         finally:
             if csv_file:
                 csv_file.close()
         
-        print("[Proactive Thread] Stopped")
+        print("[Actor/PRO] ⏹️ Stopped")
 
     def _selfadaptor_loop(self):
-        print("[Self-Adaptor Thread] Started")
+        """Execute periodic self-regulation behaviors
+        
+        NOTE: Self-adaptors execute regardless of always-on state.
+        They represent natural background behaviors that continue even when
+        the system is not actively engaging
+        """
+        print("[Actor/SA] ▶️ Self-adaptor thread started")
         
         csv_file = None
         try:
@@ -648,29 +604,27 @@ class EmbodiedBehaviour(yarp.RFModule):
                     timestamp = time.time()
                     pre = self._get_state_snapshot()
                     action = random.choice(self.SELF_ADAPTORS)
-                    ctx_name = "Calm" if pre['ctx'] == 0 else "Lively" if pre['ctx'] == 1 else "Uncertain"
                     
-                    print(f"\n[Self-Adaptor] 🔄 {action}")
-                    print(f"[Self-Adaptor] Pre-state: CTX={ctx_name}, μ={pre['IIE_mean']:.2f}")
+                    print(f"[Actor/SA] 🔄 {action}")
                     
-                    # Execute via native YARP RPC
+                    # Execute via RPC shell command
                     try:
-                        cmd_bottle = yarp.Bottle()
-                        reply_bottle = yarp.Bottle()
-                        
-                        cmd_bottle.clear()
-                        cmd_bottle.addString("exe")
-                        cmd_bottle.addString(action)
-                        
-                        self.port_rpc.write(cmd_bottle, reply_bottle)
-                        print(f"[Self-Adaptor] ✓ Action sent: {action}")
+                        result = subprocess.run(
+                            f'echo "exe {action}" | yarp rpc /interactionInterface',
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if result.returncode != 0:
+                            print(f"[Actor/SA] ❌ {result.stderr.strip()}")
+                            continue
                     except Exception as e:
-                        print(f"[Self-Adaptor] ✗ Error: {e}")
+                        print(f"[Actor/SA] ❌ {e}")
                         continue
                     
                     time.sleep(self.WAIT_AFTER_ACTION)
                     post = self._get_state_snapshot()
-                    print(f"[Self-Adaptor] Post-state: CTX={post['ctx']}, μ={post['IIE_mean']:.2f}")
                     
                     # Log to CSV
                     csv_writer.writerow([
@@ -681,15 +635,15 @@ class EmbodiedBehaviour(yarp.RFModule):
                     csv_file.flush()
                     
                 except Exception as e:
-                    print(f"[Self-Adaptor Thread] Error: {e}")
+                    print(f"[Actor/SA] ❌ {e}")
                     time.sleep(1.0)
         except Exception as e:
-            print(f"[Self-Adaptor Thread] Fatal error: {e}")
+            print(f"[Actor/SA] ❌ Fatal: {e}")
         finally:
             if csv_file:
                 csv_file.close()
         
-        print("[Self-Adaptor Thread] Stopped")
+        print("[Actor/SA] ⏹️ Stopped")
 
     # ========================================================================
     # Helper Methods
@@ -705,6 +659,52 @@ class EmbodiedBehaviour(yarp.RFModule):
             return random.choice(self.PROACTIVE_ACTIONS)
         else:
             return max(valid_q, key=valid_q.get) if valid_q else random.choice(self.PROACTIVE_ACTIONS)
+    
+    # def _check_gatekeeper(self, pre, time_delta):
+    #     """Load gatekeeper model from disk and predict 'Should I Act?'
+    #     
+    #     PHASE 3 INTEGRATION: Uncomment this method after 200+ training samples
+    #     
+    #     The model learned from RAW OUTCOMES (post-pre IIE delta > 0.02)
+    #     It recognizes pre-conditions that historically led to engagement improvement
+    #     
+    #     Args:
+    #         pre: Pre-state snapshot dict
+    #         time_delta: Time since last action (seconds)
+    #     
+    #     Returns:
+    #         bool: True = ACT (scene likely to improve), False = WAIT (scene unlikely to improve)
+    #     """
+    #     model_path = os.path.join(os.path.dirname(__file__), "gate_classifier.pkl")
+    #     
+    #     # If no model exists yet (early training), default to YES (allow exploration)
+    #     if not os.path.exists(model_path):
+    #         return True
+    #     
+    #     try:
+    #         # Load the trained model from disk (read-only)
+    #         with open(model_path, 'rb') as f:
+    #             model = pickle.load(f)
+    #         
+    #         # Encode features: MUST MATCH learning.py _encode_gate_features() ORDER EXACTLY
+    #         # [pre_IIE_mean, pre_IIE_var, pre_ctx, pre_num_faces, pre_num_mutual_gaze, time_delta]
+    #         features = np.array([[
+    #             pre['IIE_mean'],
+    #             pre['IIE_var'],
+    #             float(pre['ctx']),
+    #             float(pre['num_faces']),
+    #             float(pre['num_mutual_gaze']),
+    #             float(time_delta)
+    #         ]])
+    #         
+    #         # Predict: 1 = YES (these conditions led to improvement historically)
+    #         #          0 = NO (these conditions did not improve engagement)
+    #         prediction = model.predict(features)[0]
+    #         return prediction == 1
+    #     
+    #     except Exception as e:
+    #         print(f"[Gatekeeper] ⚠️ Prediction error: {e}")
+    #         return True  # Default to ACT if model file is corrupt/busy
     
     def _load_qtable(self, verbose=True):
         """Load Q-table from JSON file"""
@@ -725,10 +725,10 @@ class EmbodiedBehaviour(yarp.RFModule):
                 self.Q.update(new_Q)
             
             if verbose:
-                print(f"[Q-Table] Loaded {len(new_Q)} states")
+                print(f"[Actor] 💾 Q-table: {len(new_Q)} states")
         except Exception as e:
             if verbose:
-                print(f"[Q-Table] Error: {e}")
+                print(f"[Actor] ❌ Q-table: {e}")
             with self.qtable_lock:
                 self.Q.clear()
 

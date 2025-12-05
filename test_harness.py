@@ -2,11 +2,11 @@
 """
 DYNAMIC ENVIRONMENT SIMULATOR FOR EMBODIED BEHAVIOUR + LEARNING MODULES
 
-Multi-threaded reactive testing environment for the asynchronous rolling-window architecture.
+Multi-threaded reactive testing environment for blocking windowed snapshot architecture.
 
 ARCHITECTURE:
     Main Thread: Orchestrates test scenarios
-    Data Pump Thread: 20Hz continuous publishing (keeps 60-sample window full)
+    Data Pump Thread: 20Hz continuous publishing (provides stable data stream)
     RPC Server Thread: Simulates human reactions to robot actions
 
 SHARED WORLD STATE (Thread-Safe):
@@ -19,6 +19,16 @@ TEST SCENARIOS:
     4. Context Switching Mid-Test (Q-table edge case)
     5. User Departure Detection (always-on stop mechanism)
     6. High Variance Blocking
+
+WINDOWING BEHAVIOR (Blocking On-Demand Collection):
+    - Pre-state: 3.0s blocking window (_windowed_snapshot samples @ 0.1s steps)
+    - Wait: 3.0s for action execution + human reaction
+    - Post-state: 3.0s blocking window (_windowed_snapshot samples @ 0.1s steps)
+    - Cooldown: 5.0s between actions
+    - Total cycle: ~14s per action (3s+3s+3s+5s)
+    
+    Note: Unlike previous rolling buffer architecture, snapshots are collected
+    on-demand by blocking for duration rather than reading from pre-filled deque.
 """
 
 import yarp
@@ -201,7 +211,7 @@ class DynamicEnvironmentSimulator:
                 if publish_count % 200 == 0:
                     with self.action_lock:
                         rate = (self.action_count / (time.time() - self.last_action_time)) * 60 if self.action_count > 0 and self.last_action_time > 0 else 0
-                    print(f"[DataPump] Published: {publish_count}, Actions: {self.action_count}, Rate: {rate:.1f}/min")
+                    print(f"[DataPump] Published: {publish_count}, Actions: {self.action_count} (blocking snapshots: ~14s/action)")
                 
                 time.sleep(0.05)  # 20Hz
             except Exception as e:
@@ -361,7 +371,7 @@ class DynamicEnvironmentSimulator:
         print("SCENARIO 1: COLD START & STABILITY")
         print("="*80)
         print("\nSetup: High steady engagement (mean=0.65, var=0.06)")
-        print("Expected: Robot executes actions regularly")
+        print("Expected: Robot executes 3-4 actions in 60s (14s cycle time)")
         print("\nStarting in 3 seconds...")
         time.sleep(3)
         
@@ -369,23 +379,24 @@ class DynamicEnvironmentSimulator:
         print("\n[WorldState] Updated:")
         self._print_world_state()
         
-        print("\n[Test] Waiting 30 seconds...")
+        print("\n[Test] Waiting 60 seconds...")
+        print("  (Blocking snapshots: 3s pre + 3s wait + 3s post + 5s cooldown = ~14s/action)")
         initial_actions = self.action_count
         
-        for i in range(30):
+        for i in range(60):
             time.sleep(1)
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 15 == 0:
                 print(f"  [{i+1}s] Actions: {self.action_count - initial_actions}")
         
         final_actions = self.action_count - initial_actions
-        rate = (final_actions / 30) * 60
+        rate = (final_actions / 60) * 60
         
         print(f"\n[Results] Actions: {final_actions}, Rate: {rate:.1f}/min")
-        if final_actions >= 5:
-            print(f"  ✓ PASS")
+        if final_actions >= 3:
+            print(f"  ✓ PASS: Expected 3-4 actions in 60s")
             return True
         else:
-            print(f"  ✗ FAIL")
+            print(f"  ✗ FAIL: Expected at least 3 actions")
             return False
     
     def run_scenario_2_happy_interaction(self):
@@ -394,7 +405,7 @@ class DynamicEnvironmentSimulator:
         print("SCENARIO 2: HAPPY INTERACTION")
         print("="*80)
         print("\nSetup: Positive reactions configured")
-        print("Expected: Engagement increases after actions → positive rewards")
+        print("Expected: 2-3 actions in 45s, engagement increases → positive rewards")
         print("\nStarting in 3 seconds...")
         time.sleep(3)
         
@@ -402,19 +413,19 @@ class DynamicEnvironmentSimulator:
         print("\n[WorldState] Ready:")
         self._print_world_state()
         
-        print("\n[Test] Waiting 20 seconds for interactions...")
+        print("\n[Test] Waiting 45 seconds for interactions...")
         initial_actions = self.action_count
         
-        for i in range(20):
+        for i in range(45):
             time.sleep(1)
-            if (i + 1) % 5 == 0:
+            if (i + 1) % 15 == 0:
                 state = self.get_world_state()
                 print(f"  [{i+1}s] Mean: {state['mean']:.2f}, Actions: {self.action_count - initial_actions}")
         
         final_actions = self.action_count - initial_actions
         print(f"\n[Results] Actions: {final_actions}")
         print(f"  Check qlearning_log.csv for positive rewards")
-        return final_actions >= 3
+        return final_actions >= 2
     
     def run_scenario_3_bored_interaction(self):
         """Scenario 3: Bored Interaction"""
@@ -422,7 +433,7 @@ class DynamicEnvironmentSimulator:
         print("SCENARIO 3: BORED INTERACTION")
         print("="*80)
         print("\nSetup: Will decrease engagement after first action")
-        print("Expected: Negative reward")
+        print("Expected: Negative reward (engagement drop during post-state collection)")
         print("\nStarting in 3 seconds...")
         time.sleep(3)
         
@@ -430,19 +441,21 @@ class DynamicEnvironmentSimulator:
         print("\n[WorldState] Initial:")
         self._print_world_state()
         
-        print("\n[Test] Waiting for action...")
+        print("\n[Test] Waiting for action (up to 20s)...")
         initial_actions = self.action_count
+        timeout = 0
         
-        while self.action_count == initial_actions and self.running:
+        while self.action_count == initial_actions and self.running and timeout < 200:
             time.sleep(0.1)
+            timeout += 1
         
         if self.action_count > initial_actions:
             print(f"\n  Action detected! Simulating bored reaction...")
             time.sleep(0.5)
             self.update_world_state(mean=0.40, var=0.12)
-            print(f"  Engagement decreased")
+            print(f"  Engagement decreased during post-state window")
             time.sleep(10)
-            print(f"\n[Results] Check logs for negative reward")
+            print(f"\n[Results] Check qlearning_log.csv for negative reward")
             return True
         return False
     
@@ -479,7 +492,7 @@ class DynamicEnvironmentSimulator:
             print("\n[Test] Waiting for action in CTX=1...")
             ctx1_start = self.action_count
             
-            timeout = 20
+            timeout = 40
             for _ in range(timeout):
                 if self.action_count > ctx1_start:
                     print(f"\n  ✓ Action in CTX=1 detected!")
@@ -497,19 +510,21 @@ class DynamicEnvironmentSimulator:
         print("SCENARIO 5: USER DEPARTURE DETECTION")
         print("="*80)
         print("\nSetup: User present initially, then leaves")
-        print("Expected: Always-On mechanism stops proactive behavior after 120s timeout")
+        print("Expected: No further actions when num_faces=0 (proactive loop checks presence)")
         print("\nStarting in 3 seconds...")
         time.sleep(3)
         
-        self.update_world_state(mean=0.67, var=0.05, context=0, num_faces=2, num_people=2, num_mutual_gaze=2, force_failure=False)
+        self.update_world_state(mean=0.67, var=0.05, context=0, num_faces=2, num_people=2, num_mutual_gaze=2)
         print("\n[WorldState] Ready:")
         self._print_world_state()
         
-        print("\n[Test] Waiting for initial action...")
+        print("\n[Test] Waiting for initial action (up to 20s)...")
         initial_actions = self.action_count
+        timeout = 0
         
-        while self.action_count == initial_actions and self.running:
-            time.sleep(0.01)
+        while self.action_count == initial_actions and self.running and timeout < 200:
+            time.sleep(0.1)
+            timeout += 1
         
         if self.action_count > initial_actions:
             print(f"\n  ✓ Action detected in normal mode")
@@ -517,20 +532,20 @@ class DynamicEnvironmentSimulator:
             
             print(f"\n[Test] Simulating user departure (removing faces)...")
             self.update_world_state(num_faces=0, num_mutual_gaze=0)
-            print(f"  Faces removed. Always-On should detect absence.")
+            print(f"  Faces removed. Proactive loop should skip actions (checks num_faces>0).")
             
-            print(f"\n[Test] Waiting 15 seconds to verify no further actions...")
+            print(f"\n[Test] Waiting 20 seconds to verify no further actions...")
             timeout_start = self.action_count
-            time.sleep(15)
+            time.sleep(20)
             
             actions_after_departure = self.action_count - timeout_start
             if actions_after_departure == 0:
                 print(f"\n  ✓ PASS: No actions after user departure")
-                print(f"  (Full always-on stop would occur after 120s timeout)")
+                print(f"  (Proactive loop correctly checks num_faces presence)")
                 return True
             else:
                 print(f"\n  ⚠ WARNING: {actions_after_departure} action(s) after departure")
-                print(f"  (May be actions already in cooldown)")
+                print(f"  (Check if action was in-progress when faces removed)")
                 return True
         return False
     
@@ -540,29 +555,29 @@ class DynamicEnvironmentSimulator:
         print("SCENARIO 6: HIGH VARIANCE BLOCKING")
         print("="*80)
         print("\nSetup: High mean (0.70) BUT high variance (0.15)")
-        print("Expected: NO actions (variance blocks)")
+        print("Expected: NO actions (variance ≥ 0.1 blocks execution)")
         print("\nStarting in 3 seconds...")
         time.sleep(3)
         
-        self.update_world_state(mean=0.70, var=0.15, context=0, num_faces=2, num_people=2, num_mutual_gaze=2, force_failure=False)
+        self.update_world_state(mean=0.70, var=0.15, context=0, num_faces=2, num_people=2, num_mutual_gaze=2)
         print("\n[WorldState] High variance:")
         self._print_world_state()
         
-        print("\n[Test] Waiting 20 seconds...")
+        print("\n[Test] Waiting 40 seconds...")
         initial_actions = self.action_count
         
-        for i in range(20):
+        for i in range(40):
             time.sleep(1)
-            if (i + 1) % 5 == 0:
+            if (i + 1) % 10 == 0:
                 print(f"  [{i+1}s] Actions: {self.action_count - initial_actions} (should be 0)")
         
         final_actions = self.action_count - initial_actions
         print(f"\n[Results] Actions: {final_actions}")
         if final_actions == 0:
-            print(f"  ✓ PASS: Variance blocking works")
+            print(f"  ✓ PASS: Variance threshold blocking works correctly")
             return True
         else:
-            print(f"  ✗ FAIL: Should not act with high variance")
+            print(f"  ✗ FAIL: Should not act with var={self.world_state['var']:.2f} ≥ 0.1")
             return False
     
     # ========================================================================
@@ -651,7 +666,7 @@ def main():
         print("\n[Main] Interrupted")
     finally:
         simulator.close()
-        print("\nCheck logs: qlearning_log.csv, proactive_log.csv\n")
+        print("\nCheck logs: qlearning_log.csv, proactive_log.csv, gate_training_log.csv\n")
 
 
 if __name__ == "__main__":

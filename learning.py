@@ -12,21 +12,15 @@ import pickle
 import numpy as np
 import threading
 from dataclasses import dataclass
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.exceptions import NotFittedError
-
+from sklearn.ensemble import  GradientBoostingClassifier
 
 class Learning(yarp.RFModule):
 
     # Configuration Constants
     QTABLE_PATH = "learning_qtable.json"
     QLEARNING_LOG = "qlearning_log.csv"
-    MODEL_TRAINING_LOG = "model_training_log.csv"
-    MODEL_PREDICTION_LOG = "model_prediction_log.csv"
-    MODEL_PATH = "iie_transition_model.pkl"
-    SCALER_PATH = "iie_scaler.pkl"
-    CTX_MODEL_PATH = "ctx_transition_model.pkl"
+    GATE_MODEL_PATH = "gate_classifier.pkl"
+    GATE_LOG = "gate_training_log.csv"
     
     ALPHA = 0.30
     GAMMA = 0.92
@@ -40,10 +34,12 @@ class Learning(yarp.RFModule):
     VAR_EPS = 0.02    # Dead zone: minimum variance change to be considered meaningful
     
     BUFFER_SIZE = 10
-    MODEL_MAX_DEPTH = 2
-    MODEL_N_ESTIMATORS = 50
-    MODEL_LEARNING_RATE = 0.1
-    MAX_ESTIMATORS = 200
+    GATE_MAX_DEPTH = 3
+    GATE_N_ESTIMATORS = 100
+    GATE_LEARNING_RATE = 0.1
+    GATE_MAX_ESTIMATORS = 200
+    
+    REWARD_THRESHOLD = 0.05  # Minimum reward to classify scene as "YES"
     
     ACTION_COSTS = {
         "ao_greet": 0.08,
@@ -64,11 +60,8 @@ class Learning(yarp.RFModule):
         base_dir = os.path.dirname(__file__)
         self.QTABLE_PATH = os.path.join(base_dir, self.QTABLE_PATH)
         self.QLEARNING_LOG = os.path.join(base_dir, self.QLEARNING_LOG)
-        self.MODEL_TRAINING_LOG = os.path.join(base_dir, self.MODEL_TRAINING_LOG)
-        self.MODEL_PATH = os.path.join(base_dir, self.MODEL_PATH)
-        self.SCALER_PATH = os.path.join(base_dir, self.SCALER_PATH)
-        self.CTX_MODEL_PATH = os.path.join(base_dir, self.CTX_MODEL_PATH)
-        self.MODEL_PREDICTION_LOG = os.path.join(base_dir, self.MODEL_PREDICTION_LOG)
+        self.GATE_MODEL_PATH = os.path.join(base_dir, self.GATE_MODEL_PATH)
+        self.GATE_LOG = os.path.join(base_dir, self.GATE_LOG)
         
         # Ports
         self.port_input = yarp.BufferedPortBottle()
@@ -77,22 +70,11 @@ class Learning(yarp.RFModule):
         self.Q = {}
         self.q_lock = threading.Lock()
         
-        # Transition models
-        self.scaler = StandardScaler()
-        self.iie_model = GradientBoostingRegressor(
-            n_estimators=self.MODEL_N_ESTIMATORS,
-            learning_rate=self.MODEL_LEARNING_RATE,
-            max_depth=self.MODEL_MAX_DEPTH,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            subsample=0.8,
-            random_state=42,
-            warm_start=True
-        )
-        self.ctx_model = GradientBoostingClassifier(
-            n_estimators=self.MODEL_N_ESTIMATORS,
-            learning_rate=self.MODEL_LEARNING_RATE,
-            max_depth=self.MODEL_MAX_DEPTH,
+        # Gatekeeper Model (Scene Discriminator)
+        self.gate_model = GradientBoostingClassifier(
+            n_estimators=self.GATE_N_ESTIMATORS,
+            learning_rate=self.GATE_LEARNING_RATE,
+            max_depth=self.GATE_MAX_DEPTH,
             min_samples_split=2,
             min_samples_leaf=1,
             subsample=0.8,
@@ -100,21 +82,20 @@ class Learning(yarp.RFModule):
             warm_start=True
         )
         
-        self.iie_initialized = False
-        self.ctx_initialized = False
-        self.iie_buffer_X = []
-        self.iie_buffer_y = []
-        self.ctx_buffer_X = []
-        self.ctx_buffer_y = []
+        self.gate_initialized = False
+        self.gate_buffer_X = []
+        self.gate_buffer_y = []
+        
+        # Timing for scene discrimination
+        self.last_exp_timestamp = None
         
         # CSV logging
         self.qlearning_csv = None
-        self.model_csv = None
-        self.prediction_csv = None
+        self.gate_csv = None
         
         # Statistics
         self.qlearning_count = 0
-        self.model_count = 0
+        self.gate_count = 0
     
     # ========================================================================
     # Experience Data Structure
@@ -166,33 +147,26 @@ class Learning(yarp.RFModule):
     def configure(self, rf):
         """Initialize module"""
         print("\n" + "="*70)
-        print("LEARNING MODULE - Single Unit Architecture")
+        print("[Learner] 🧠 LEARNING MODULE")
         print("="*70)
-        print(f"\n[Paths]")
-        print(f"  Q-table: {self.QTABLE_PATH}")
-        print(f"  Models: {self.MODEL_PATH}")
-        print(f"  Logs: {self.QLEARNING_LOG}, {self.MODEL_PREDICTION_LOG}")
+        print(f"[Learner] 📁 Paths: Q={os.path.basename(self.QTABLE_PATH)}, Gate={os.path.basename(self.GATE_MODEL_PATH)}")
         
         # Open ports
         if not self.port_input.open("/alwayson/learning/experiences:i"):
-            print("[ERROR] Failed to open input port")
+            print("[Learner] ❌ Port failed")
             return False
         
-        print("\n[Ports] Input port opened successfully")
+        print("[Learner] ✅ Port ready")
         
-        # Load Q-table and models
+        # Load Q-table and gatekeeper model
         self._load_qtable()
-        self._load_models()
+        self._load_gate_model()
         
         # Initialize CSV logs
         self._init_csv_logs()
         
-        print(f"\n[Config] Q-Learning: α={self.ALPHA}, γ={self.GAMMA}")
-        print(f"[Config] Reward Weights: Δμ={self.W_DELTA}, σ²={self.W_VAR}, level={self.W_LEVEL}")
-        print(f"[Config] Threshold: μ_min={self.THRESH_MEAN} (2x penalty if dropped below)")
-        print(f"[Config] Dead Zones: Δμ_min={self.DELTA_EPS}, Δσ²_min={self.VAR_EPS} (noise filtering)")
-        print(f"[Config] ML Models: {self.MODEL_N_ESTIMATORS} trees, depth={self.MODEL_MAX_DEPTH}, buffer={self.BUFFER_SIZE}")
-        print(f"[Status] IIE Model={'Trained' if self.iie_initialized else 'New'}, Context Model={'Trained' if self.ctx_initialized else 'New'}")
+        print(f"[Learner] 📊 Q-Learning: α={self.ALPHA}, γ={self.GAMMA}")
+        print(f"[Learner] 🎯 Gatekeeper: {'Trained' if self.gate_initialized else 'New'} ({self.GATE_N_ESTIMATORS} trees)")
         print("="*70 + "\n")
         
         return True
@@ -218,26 +192,23 @@ class Learning(yarp.RFModule):
     
     def close(self):
         """Cleanup"""
-        print("\n[Shutdown] Closing learning module...")
+        print("\n[Learner] 🛑 Shutting down...")
         
-        # Save Q-table and models
+        # Save Q-table and gatekeeper model
         self._save_qtable()
-        self._save_models()
+        self._save_gate_model()
         
         # Close CSV files
         if self.qlearning_csv:
             self.qlearning_csv.close()
-        if self.model_csv:
-            self.model_csv.close()
-        if self.prediction_csv:
-            self.prediction_csv.close()
+        if self.gate_csv:
+            self.gate_csv.close()
         
         # Close ports
         self.port_input.close()
         
-        print(f"[Shutdown] Q-updates: {self.qlearning_count}, ML training samples: {self.model_count}")
-        print(f"[Shutdown] Models saved: IIE={self.iie_initialized}, Context={self.ctx_initialized}")
-        print("[Shutdown] Complete")
+        print(f"[Learner] 💾 Saved: Q={self.qlearning_count}, Gate={self.gate_count}")
+        print("[Learner] ✅ Shutdown complete")
         return True
     
     # ========================================================================
@@ -245,25 +216,20 @@ class Learning(yarp.RFModule):
     # ========================================================================
     
     def _process_experience(self, exp):
+        """Process experience: Q-learning + gatekeeper training"""
         try:
-            print(f"\n{'='*60}")
-            print(f"[EXP] 📥 Received: {exp.action}")
-            print(f"[EXP] Pre:  CTX={exp.pre_ctx}, μ={exp.pre_IIE_mean:.2f}, σ²={exp.pre_IIE_var:.2f}, faces={exp.pre_num_faces}, gaze={exp.pre_num_mutual_gaze}")
-            print(f"[EXP] Post: CTX={exp.post_ctx}, μ={exp.post_IIE_mean:.2f}, σ²={exp.post_IIE_var:.2f}, faces={exp.post_num_faces}, gaze={exp.post_num_mutual_gaze}")
+            print(f"\n[Learner] 📥 {exp.action}")
+            print(f"[Learner] Pre→Post: μ {exp.pre_IIE_mean:.2f}→{exp.post_IIE_mean:.2f}, CTX{exp.pre_ctx}→{exp.post_ctx}")
             
-            # ML Model Predictions (MUST happen before any training)
-            predicted_iie_delta, predicted_post_mean, predicted_post_ctx = self._get_predictions(exp)
+            # Calculate time delta since last experience
+            if self.last_exp_timestamp is None:
+                time_delta = 10.0  # Default for first experience
+            else:
+                time_delta = exp.timestamp - self.last_exp_timestamp
+                time_delta = min(time_delta, 60.0)  # Clamp to 60s max (prevent outliers after long idle)
             
-            pred_error = abs(exp.post_IIE_mean - predicted_post_mean)
-            ctx_match = "✓" if predicted_post_ctx == exp.post_ctx else "✗"
-            print(f"\n[Prediction] IIE Model:")
-            print(f"  • Predicted: {exp.pre_IIE_mean:.2f} → {predicted_post_mean:.2f} (Δ={predicted_iie_delta:+.2f})")
-            print(f"  • Actual:    {exp.pre_IIE_mean:.2f} → {exp.post_IIE_mean:.2f}")
-            print(f"  • Error:     {pred_error:.3f}")
-            print(f"[Prediction] Context Model: {predicted_post_ctx} {ctx_match} (actual: {exp.post_ctx})")
-            
-            # Log predictions vs actuals
-            self._log_predictions(exp, predicted_iie_delta, predicted_post_mean, predicted_post_ctx)
+            # Store experience for logging (needed by _log_gate_training)
+            self._last_exp = exp
             
             # Q-Learning Update
             if exp.pre_ctx != -1 and exp.post_ctx != -1:
@@ -274,36 +240,38 @@ class Learning(yarp.RFModule):
                 self.qlearning_count += 1
                 self._save_qtable()
                 
-                print(f"\n[Q-Learning] Update #{self.qlearning_count}:")
-                print(f"  • Reward: {reward:+.3f}")
-                print(f"  • Q-value: {old_q:.3f} → {new_q:.3f} (TD error: {td_error:+.3f})")
-                print(f"  • State: CTX{exp.pre_ctx} → CTX{exp.post_ctx}")
-                print(f"  • Q-table saved")
+                reward_emoji = "✅" if reward > 0 else "⏸️" if reward == 0 else "❌"
+                print(f"[Learner/Q] {reward_emoji} R={reward:+.2f}, Q: {old_q:.2f}→{new_q:.2f}, TD={td_error:+.2f}")
+                
+                # Train Gatekeeper (Scene Discriminator)
+                # OBJECTIVE: Learn from RAW OUTCOME (independent of Q-learning reward)
+                # 
+                # Calculate Raw Improvement (Physical Reality)
+                raw_delta = exp.post_IIE_mean - exp.pre_IIE_mean
+                
+                # Assign Label based on Direct Comparison (Pre vs Post)
+                # If interaction caused real engagement increase → It was a "YES" moment
+                # Threshold: 0.02 (small positive change = improvement)
+                if raw_delta > 0.02:
+                    label = 1  # YES: This pre-state led to improvement
+                else:
+                    label = 0  # NO: This pre-state did not lead to improvement
+                
+                label_emoji = "✅YES" if label == 1 else "⏸️NO"
+                print(f"[Learner/Gate] {label_emoji} Δ={raw_delta:+.2f}")
+                
+                # Encode pre-state features (6D - for inference)
+                features = self._encode_gate_features(exp, time_delta)
+                
+                # Train gatekeeper model
+                self._train_gate_model(features, label, reward)
+                self.gate_count += 1
             
-            # ML Model Training (happens AFTER prediction logging)
-            features = self._encode_features(exp)
-            target_delta = exp.post_IIE_mean - exp.pre_IIE_mean
-            
-            # Train IIE Model (regression)
-            self._train_iie_model_only(features, target_delta)
-            self.model_count += 1
-            
-            # Train Context Model (classification)
-            if exp.pre_ctx in (0, 1) and exp.post_ctx in (0, 1):
-                self._train_ctx_model(features, exp.post_ctx)
-            
-            # Log model training sample
-            self._log_model_training(exp, target_delta, predicted_iie_delta, 
-                                    abs(target_delta - predicted_iie_delta))
-            
-            print(f"\n[Training] Model #{self.model_count}:")
-            print(f"  • IIE Buffer: {len(self.iie_buffer_X)}/{self.BUFFER_SIZE} samples")
-            print(f"  • CTX Buffer: {len(self.ctx_buffer_X)}/{self.BUFFER_SIZE} samples")
-            print(f"  • Target ΔIIE: {target_delta:+.3f}")
-            print(f"{'='*60}\n")
+            # Update timestamp for next experience
+            self.last_exp_timestamp = exp.timestamp
             
         except Exception as e:
-            print(f"[ERROR] Processing experience: {e}")
+            print(f"[Learner] ❌ {e}")
 
     # ========================================================================
     # Q-Learning Methods
@@ -365,141 +333,99 @@ class Learning(yarp.RFModule):
             return old_q, new_q, td_error
 
     # ========================================================================
-    # Model Methods
+    # Gatekeeper (Scene Discriminator) Methods
     # ========================================================================
     
-    def _encode_features(self, exp):
-        """Encode 8D feature vector"""
-        action_id = self.ACTION_TO_ID.get(exp.action, 0)
-        action_one_hot = [0.0, 0.0, 0.0]
-        action_one_hot[action_id] = 1.0
+    def _encode_gate_features(self, exp, time_delta):
+        """Encode pre-action state features for inference
         
+        CRITICAL: Only pre-state features for prediction
+        The model must decide based on what it sees BEFORE acting
+        """
         return np.array([[
-            exp.pre_IIE_mean, exp.pre_IIE_var, float(exp.pre_ctx),
-            float(exp.pre_num_faces), float(exp.pre_num_mutual_gaze),
-            action_one_hot[0], action_one_hot[1], action_one_hot[2]
+            exp.pre_IIE_mean,                  # Engagement level (pre)
+            exp.pre_IIE_var,                   # Stability (pre)
+            float(exp.pre_ctx),                # Context (pre)
+            float(exp.pre_num_faces),          # Audience size (pre)
+            float(exp.pre_num_mutual_gaze),    # Attention (pre)
+            float(time_delta)                  # Time since last action
         ]])
     
-    def _train_iie_model_only(self, features, target_delta):
-        """Train IIE regressor (without returning predictions - those are made separately)"""
-        self.scaler.partial_fit(features)
-        features_scaled = self.scaler.transform(features)
+    def _train_gate_model(self, features, label, reward):
+        """Train gatekeeper classifier to recognize opportune moments
         
+        OBJECTIVE: Learn from raw outcomes (pre vs post), NOT reward function
+        
+        Args:
+            features: 6D pre-state feature vector (inference input)
+            label: 1 (YES - led to improvement) or 0 (NO - no improvement)
+            reward: Q-learning reward (logged for reference only, NOT used in training)
+        
+        Labeling Logic:
+            raw_delta = post_IIE - pre_IIE
+            label = 1 if raw_delta > 0.02 else 0
+        
+        The model learns: "These pre-conditions historically led to engagement increase"
+        """
         # Add to buffer
-        self.iie_buffer_X.append(features_scaled[0])
-        self.iie_buffer_y.append(target_delta)
+        self.gate_buffer_X.append(features[0])
+        self.gate_buffer_y.append(label)
         
         # Train when buffer full
-        if len(self.iie_buffer_X) >= self.BUFFER_SIZE:
-            X_batch = np.array(self.iie_buffer_X)
-            y_batch = np.array(self.iie_buffer_y)
+        if len(self.gate_buffer_X) >= self.BUFFER_SIZE:
+            X_batch = np.array(self.gate_buffer_X)
+            y_batch = np.array(self.gate_buffer_y)
             
-            if not self.iie_initialized:
-                print(f"[IIE Model] 🎉 Initializing with {len(y_batch)} samples...")
-                self.iie_model.fit(X_batch, y_batch)
-                self.iie_initialized = True
-                print(f"[IIE Model] ✓ Initialized ({self.iie_model.n_estimators} trees)")
+            if not self.gate_initialized:
+                self.gate_model.fit(X_batch, y_batch)
+                self.gate_initialized = True
+                print(f"[Learner/Gate] 🎉 Initialized ({self.gate_model.n_estimators} trees)")
             else:
-                old_n = self.iie_model.n_estimators
-                if self.iie_model.n_estimators < self.MAX_ESTIMATORS:
-                    self.iie_model.n_estimators += 5
-                print(f"[IIE Model] 📈 Training with {len(y_batch)} samples (trees: {old_n}→{self.iie_model.n_estimators})...")
-                self.iie_model.fit(X_batch, y_batch)
-                print(f"[IIE Model] ✓ Updated")
+                old_n = self.gate_model.n_estimators
+                if self.gate_model.n_estimators < self.GATE_MAX_ESTIMATORS:
+                    self.gate_model.n_estimators += 5
+                self.gate_model.fit(X_batch, y_batch)
+                print(f"[Learner/Gate] 📈 Trained: {old_n}→{self.gate_model.n_estimators} trees")
             
-            self.iie_buffer_X.clear()
-            self.iie_buffer_y.clear()
-            print(f"[IIE Model] 🗑️ Buffer cleared")
+            # Log training batch
+            yes_count = sum(y_batch)
+            no_count = len(y_batch) - yes_count
+            print(f"[Learner/Gate] Batch: {yes_count}✅ {no_count}⏸️")
+            
+            # Save model
+            self._save_gate_model()
+            
+            self.gate_buffer_X.clear()
+            self.gate_buffer_y.clear()
+        
+        # Log individual training sample
+        # Note: features[0] is the 1D array from features (6 elements)
+        # We need to pass exp data separately for logging post values
+        self._log_gate_training(features[0], label, reward, 
+                               post_IIE_mean=self._last_exp.post_IIE_mean,
+                               raw_delta=(self._last_exp.post_IIE_mean - self._last_exp.pre_IIE_mean))
     
-    def _train_ctx_model(self, features, target_ctx):
+    def predict_decision(self, pre_IIE_mean, pre_IIE_var, pre_ctx, pre_num_faces, pre_num_mutual_gaze, time_delta):
 
-        try:
-            features_scaled = self.scaler.transform(features)
-        except NotFittedError:
-            # Scaler not fitted yet, skip this training
-            return
-        
-        self.ctx_buffer_X.append(features_scaled[0])
-        self.ctx_buffer_y.append(target_ctx)
-        
-        if len(self.ctx_buffer_X) >= self.BUFFER_SIZE:
-            X_batch = np.array(self.ctx_buffer_X)
-            y_batch = np.array(self.ctx_buffer_y)
-            
-            if not self.ctx_initialized:
-                print(f"[CTX Model] 🎉 Initializing with {len(y_batch)} samples...")
-                self.ctx_model.fit(X_batch, y_batch)
-                self.ctx_initialized = True
-                print(f"[CTX Model] ✓ Initialized ({self.ctx_model.n_estimators} trees)")
-            else:
-                old_n = self.ctx_model.n_estimators
-                if self.ctx_model.n_estimators < self.MAX_ESTIMATORS:
-                    self.ctx_model.n_estimators += 5
-                print(f"[CTX Model] 📈 Training with {len(y_batch)} samples (trees: {old_n}→{self.ctx_model.n_estimators})...")
-                self.ctx_model.fit(X_batch, y_batch)
-                print(f"[CTX Model] ✓ Updated")
-            
-            self.ctx_buffer_X.clear()
-            self.ctx_buffer_y.clear()
-            print(f"[CTX Model] 🗑️ Buffer cleared")
-    
-    def _predict_iie_delta(self, action, pre_mean, pre_var, pre_ctx, pre_faces, pre_mutual_gaze):
-        """Predict IIE mean change"""
-        if not self.iie_initialized:
-            return 0.0
+        if not self.gate_initialized:
+            # Model not trained yet, default to True (allow actions)
+            return True
         
         try:
-            action_id = self.ACTION_TO_ID.get(action, 0)
-            action_one_hot = [0.0, 0.0, 0.0]
-            action_one_hot[action_id] = 1.0
-            
             features = np.array([[
-                pre_mean, pre_var, float(pre_ctx),
-                float(pre_faces), float(pre_mutual_gaze),
-                action_one_hot[0], action_one_hot[1], action_one_hot[2]
+                pre_IIE_mean,
+                pre_IIE_var,
+                float(pre_ctx),
+                float(pre_num_faces),
+                float(pre_num_mutual_gaze),
+                float(time_delta)
             ]])
             
-            features_scaled = self.scaler.transform(features)
-            return self.iie_model.predict(features_scaled)[0]
-        except (NotFittedError, Exception) as e:
-            return 0.0
-    
-    def _predict_post_ctx(self, action, pre_mean, pre_var, pre_ctx, pre_faces, pre_mutual_gaze):
-        """Predict post-action context"""
-        default = int(pre_ctx) if pre_ctx in (0, 1) else 0
-        
-        if not self.ctx_initialized:
-            return default
-        
-        try:
-            action_id = self.ACTION_TO_ID.get(action, 0)
-            action_one_hot = [0.0, 0.0, 0.0]
-            action_one_hot[action_id] = 1.0
-            
-            features = np.array([[
-                pre_mean, pre_var, float(pre_ctx),
-                float(pre_faces), float(pre_mutual_gaze),
-                action_one_hot[0], action_one_hot[1], action_one_hot[2]
-            ]])
-            
-            features_scaled = self.scaler.transform(features)
-            proba = self.ctx_model.predict_proba(features_scaled)[0]
-            return int(proba[1] >= 0.5)
-        except (NotFittedError, Exception):
-            return default
-    
-    def _get_predictions(self, exp):
-        """Get ML model predictions for experience (before training)"""
-        predicted_iie_delta = self._predict_iie_delta(
-            exp.action, exp.pre_IIE_mean, exp.pre_IIE_var, exp.pre_ctx,
-            exp.pre_num_faces, exp.pre_num_mutual_gaze
-        )
-        predicted_post_mean = exp.pre_IIE_mean + predicted_iie_delta
-        predicted_post_ctx = self._predict_post_ctx(
-            exp.action, exp.pre_IIE_mean, exp.pre_IIE_var, exp.pre_ctx,
-            exp.pre_num_faces, exp.pre_num_mutual_gaze
-        )
-        return predicted_iie_delta, predicted_post_mean, predicted_post_ctx
+            prediction = self.gate_model.predict(features)[0]
+            return bool(prediction == 1)
+        except Exception as e:
+            print(f"[Learner/Gate] ❌ Predict: {e}")
+            return True  # Default to allowing action on error
 
     # ========================================================================
     # File I/O
@@ -508,7 +434,7 @@ class Learning(yarp.RFModule):
     def _load_qtable(self):
         """Load Q-table from JSON"""
         if not os.path.exists(self.QTABLE_PATH):
-            print("[Q-Table] Not found, initializing empty")
+            print("[Learner] 💾 Q-table: new")
             return
         
         try:
@@ -518,12 +444,12 @@ class Learning(yarp.RFModule):
             with self.q_lock:
                 self.Q = data.get("Q", {})
             
-            print(f"[Q-Table] Loaded: {len(self.Q)} states")
+            print(f"[Learner] 💾 Q-table: {len(self.Q)} states")
         except Exception as e:
-            print(f"[Q-Table] Error loading: {e}")
+            print(f"[Learner] ❌ Q-table: {e}")
     
     def _save_qtable(self):
-        """Save Q-table to JSON with atomic write"""
+        """Save Q-table to JSON with atomic write (temp + rename)"""
         try:
             with self.q_lock:
                 Q_copy = dict(self.Q)
@@ -539,57 +465,34 @@ class Learning(yarp.RFModule):
             with open(tmp_path, 'w') as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, self.QTABLE_PATH)  # Atomic on POSIX systems
-            
-            if self.qlearning_count % 10 == 0:
-                print(f"✓ Q-table saved (n={self.qlearning_count} states={len(self.Q)})")
         except Exception as e:
-            print(f"[ERROR] Saving Q-table: {e}")
+            print(f"[Learner] ❌ Q-save: {e}")
     
-    def _load_models(self):
-        """Load transition models"""
-        success = False
+    def _load_gate_model(self):
+        """Load gatekeeper model from disk"""
+        if not os.path.exists(self.GATE_MODEL_PATH):
+            print("[Learner/Gate] 💾 Model: new")
+            return
         
-        if os.path.exists(self.MODEL_PATH) and os.path.exists(self.SCALER_PATH):
-            try:
-                with open(self.MODEL_PATH, 'rb') as f:
-                    self.iie_model = pickle.load(f)
-                with open(self.SCALER_PATH, 'rb') as f:
-                    self.scaler = pickle.load(f)
-                self.iie_initialized = True
-                success = True
-            except Exception as e:
-                print(f"[Models] Error loading IIE model: {e}")
-        
-        if os.path.exists(self.CTX_MODEL_PATH):
-            try:
-                with open(self.CTX_MODEL_PATH, 'rb') as f:
-                    self.ctx_model = pickle.load(f)
-                self.ctx_initialized = True
-                success = True
-            except Exception as e:
-                print(f"[Models] Error loading context model: {e}")
-        
-        if success:
-            print("[Models] Loaded from disk")
-        else:
-            print("[Models] Starting fresh")
-    
-    def _save_models(self):
-        """Save transition models"""
         try:
-            if self.iie_initialized:
-                with open(self.MODEL_PATH, 'wb') as f:
-                    pickle.dump(self.iie_model, f)
-                with open(self.SCALER_PATH, 'wb') as f:
-                    pickle.dump(self.scaler, f)
-            
-            if self.ctx_initialized:
-                with open(self.CTX_MODEL_PATH, 'wb') as f:
-                    pickle.dump(self.ctx_model, f)
-            
-            print("[Models] Saved to disk")
+            with open(self.GATE_MODEL_PATH, 'rb') as f:
+                self.gate_model = pickle.load(f)
+            self.gate_initialized = True
+            print(f"[Learner/Gate] 💾 Model: {self.gate_model.n_estimators} trees")
         except Exception as e:
-            print(f"[ERROR] Saving models: {e}")
+            print(f"[Learner/Gate] ❌ Load failed: {e}")
+    
+    def _save_gate_model(self):
+        """Save gatekeeper model to disk"""
+        if not self.gate_initialized:
+            return
+        
+        try:
+            with open(self.GATE_MODEL_PATH, 'wb') as f:
+                pickle.dump(self.gate_model, f)
+            print(f"[Learner/Gate] 💾 Saved ({self.gate_model.n_estimators} trees)")
+        except Exception as e:
+            print(f"[Learner/Gate] ❌ Save failed: {e}")
 
     # ========================================================================
     # CSV Logging
@@ -609,41 +512,24 @@ class Learning(yarp.RFModule):
                                'pre_IIE_var', 'post_IIE_var', 'var_reduction',
                                'reward', 'old_q', 'new_q', 'td_error'])
             
-            # Model training log
-            file_exists = os.path.exists(self.MODEL_TRAINING_LOG)
-            self.model_csv = open(self.MODEL_TRAINING_LOG, 'a', newline='')
-            writer = csv.writer(self.model_csv)
+            # Gatekeeper training log
+            file_exists = os.path.exists(self.GATE_LOG)
+            self.gate_csv = open(self.GATE_LOG, 'a', newline='')
+            writer = csv.writer(self.gate_csv)
             
             if not file_exists:
-                writer.writerow(['timestamp', 'proactive_action', 'pre_IIE_mean', 'pre_IIE_var',
-                               'pre_ctx', 'pre_num_faces', 'pre_num_mutual_gaze',
-                               'target_delta_IIE', 'predicted_delta_IIE',
-                               'prediction_error', 'model_training_count'])
-            
-            # Model prediction log
-            file_exists = os.path.exists(self.MODEL_PREDICTION_LOG)
-            self.prediction_csv = open(self.MODEL_PREDICTION_LOG, 'a', newline='')
-            writer = csv.writer(self.prediction_csv)
-            
-            if not file_exists:
-                writer.writerow(['timestamp', 'proactive_action',
-                               'pre_IIE_mean', 'pre_IIE_var', 'pre_ctx',
-                               'pre_num_faces', 'pre_num_mutual_gaze',
-                               'predicted_IIE_delta', 'predicted_post_IIE_mean', 'predicted_post_ctx',
-                               'actual_post_IIE_mean', 'actual_post_ctx',
-                               'iie_prediction_error', 'ctx_prediction_correct'])
+                writer.writerow(['timestamp', 'pre_IIE_mean', 'pre_IIE_var', 'pre_ctx',
+                               'pre_num_faces', 'pre_num_mutual_gaze', 'time_delta',
+                               'post_IIE_mean', 'raw_delta', 'label', 'reward_ref', 'gate_count'])
         except Exception as e:
-            print(f"[ERROR] Initializing CSV logs: {e}")
+            print(f"[Learner] ❌ CSV init: {e}")
             # Close any opened files
             if self.qlearning_csv:
                 self.qlearning_csv.close()
                 self.qlearning_csv = None
-            if self.model_csv:
-                self.model_csv.close()
-                self.model_csv = None
-            if self.prediction_csv:
-                self.prediction_csv.close()
-                self.prediction_csv = None
+            if self.gate_csv:
+                self.gate_csv.close()
+                self.gate_csv = None
             raise
     
     def _log_qlearning(self, exp, reward, old_q, new_q, td_error):
@@ -662,39 +548,27 @@ class Learning(yarp.RFModule):
         ])
         self.qlearning_csv.flush()
     
-    def _log_model_training(self, exp, target_delta, predicted_delta, error):
-        """Log model training"""
-        if not self.model_csv:
+    def _log_gate_training(self, features, label, reward, post_IIE_mean, raw_delta):
+        """Log gatekeeper training sample"""
+        if not self.gate_csv:
             return
         
-        writer = csv.writer(self.model_csv)
+        writer = csv.writer(self.gate_csv)
         writer.writerow([
-            exp.timestamp, exp.action,
-            f"{exp.pre_IIE_mean:.4f}", f"{exp.pre_IIE_var:.4f}", exp.pre_ctx,
-            exp.pre_num_faces, exp.pre_num_mutual_gaze,
-            f"{target_delta:.4f}", f"{predicted_delta:.4f}",
-            f"{error:.4f}", self.model_count
+            time.time(),
+            f"{features[0]:.4f}",  # pre_IIE_mean (feature)
+            f"{features[1]:.4f}",  # pre_IIE_var (feature)
+            int(features[2]),      # pre_ctx (feature)
+            int(features[3]),      # pre_num_faces (feature)
+            int(features[4]),      # pre_num_mutual_gaze (feature)
+            f"{features[5]:.2f}",  # time_delta (feature)
+            f"{post_IIE_mean:.4f}",  # post_IIE_mean (outcome, not feature)
+            f"{raw_delta:.4f}",      # raw_delta (labeling criterion)
+            label,                    # 1 (YES) or 0 (NO)
+            f"{reward:.4f}",          # reward_ref (Q-learning only, not used here)
+            self.gate_count
         ])
-        self.model_csv.flush()
-    
-    def _log_predictions(self, exp, predicted_iie_delta, predicted_post_mean, predicted_post_ctx):
-        """Log ML model predictions vs actual outcomes"""
-        if not self.prediction_csv:
-            return
-        
-        iie_error = abs(exp.post_IIE_mean - predicted_post_mean)
-        ctx_correct = 1 if predicted_post_ctx == exp.post_ctx else 0
-        
-        writer = csv.writer(self.prediction_csv)
-        writer.writerow([
-            exp.timestamp, exp.action,
-            f"{exp.pre_IIE_mean:.4f}", f"{exp.pre_IIE_var:.4f}", exp.pre_ctx,
-            exp.pre_num_faces, exp.pre_num_mutual_gaze,
-            f"{predicted_iie_delta:.4f}", f"{predicted_post_mean:.4f}", predicted_post_ctx,
-            f"{exp.post_IIE_mean:.4f}", exp.post_ctx,
-            f"{iie_error:.4f}", ctx_correct
-        ])
-        self.prediction_csv.flush()
+        self.gate_csv.flush()
 
 
 # ============================================================================
