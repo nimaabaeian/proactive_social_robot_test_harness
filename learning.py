@@ -343,8 +343,8 @@ class Learning(yarp.RFModule):
         The model must decide based on what it sees BEFORE acting
         """
         return np.array([[
-            exp.pre_IIE_mean,                  # Engagement level (pre)
-            exp.pre_IIE_var,                   # Stability (pre)
+            exp.pre_IIE_mean,                  # Interaction intention (pre)
+            exp.pre_IIE_var,                   # Intention stability (pre)
             float(exp.pre_ctx),                # Context (pre)
             float(exp.pre_num_faces),          # Audience size (pre)
             float(exp.pre_num_mutual_gaze),    # Attention (pre)

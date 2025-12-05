@@ -373,7 +373,7 @@ class EmbodiedBehaviour(yarp.RFModule):
                             self.alwayson_active = False
                         print("[Actor/AO] ✅ Stopped")                # Check if we should start (faces detected while stopped)
                 elif not is_active and snapshot['num_faces'] > 0:
-                    print(f"\n[Always-On Monitor] ▶ Faces detected, starting...")
+                    print(f"[Actor/AO] ▶️ Faces detected → starting")
                     if self._execute_alwayson_command("ao_start"):
                         with self.alwayson_lock:
                             self.alwayson_active = True
@@ -689,12 +689,12 @@ class EmbodiedBehaviour(yarp.RFModule):
     #         # Encode features: MUST MATCH learning.py _encode_gate_features() ORDER EXACTLY
     #         # [pre_IIE_mean, pre_IIE_var, pre_ctx, pre_num_faces, pre_num_mutual_gaze, time_delta]
     #         features = np.array([[
-    #             pre['IIE_mean'],
-    #             pre['IIE_var'],
-    #             float(pre['ctx']),
-    #             float(pre['num_faces']),
-    #             float(pre['num_mutual_gaze']),
-    #             float(time_delta)
+    #             pre['IIE_mean'],               # Interaction intention (pre)
+    #             pre['IIE_var'],                # Intention stability (pre)
+    #             float(pre['ctx']),             # Context (pre)
+    #             float(pre['num_faces']),       # Audience size (pre)
+    #             float(pre['num_mutual_gaze']), # Attention (pre)
+    #             float(time_delta)              # Time since last action
     #         ]])
     #         
     #         # Predict: 1 = YES (these conditions led to improvement historically)

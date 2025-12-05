@@ -617,7 +617,7 @@ delta_mean = post_IIE_mean - pre_IIE_mean
 if abs(delta_mean) < DELTA_EPS:  # 0.05 dead zone
     delta_mean = 0.0
 ```
-- **Purpose**: Reward increasing engagement
+- **Purpose**: Reward increasing interaction intention
 - **Dead zone**: Filters noise ±0.05
 - **Example**: 0.65 → 0.75 gives +0.10
 
@@ -637,7 +637,7 @@ level_term = post_IIE_mean - THRESH_MEAN  # 0.5 threshold
 if post_IIE_mean < THRESH_MEAN:
     level_term *= 2.0  # Double penalty!
 ```
-- **Purpose**: Maintain engagement above threshold
+- **Purpose**: Maintain interaction intention above threshold
 - **Positive**: Comfortably above 0.5
 - **Negative**: Below 0.5 (2× penalty)
 - **Example**: 
@@ -680,19 +680,19 @@ reward = 0.23 (no change)
 ```
 
 **Reward Philosophy**:
-- **Delta**: Reward improvement
+- **Delta**: Reward improvement in interaction intention
 - **Variance**: Reward stability
-- **Level**: Maintain high engagement (don't break interaction!)
+- **Level**: Maintain high interaction intention (don't break interaction!)
 - **Cost**: Discourage excessive actions
 - **Clipping**: Bound to [-1.0, 1.0] for numerical stability (prevents outliers)
 
 #### 3. Gatekeeper Model (Scene Discriminator)
 
-**Purpose**: Learn to recognize pre-conditions that lead to engagement improvement
+**Purpose**: Learn to recognize pre-conditions that lead to interaction intention improvement
 
 **Philosophy**: 
 - **Learns from RAW OUTCOMES**: Independent of Q-learning reward function
-- **Binary Classification**: Did engagement actually increase after this action?
+- **Binary Classification**: Did interaction intention actually increase after this action?
 - **Physical Reality**: Compares post-IIE vs pre-IIE directly (no weights, no penalties)
 
 **Model**: Binary Classifier
