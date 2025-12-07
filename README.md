@@ -86,8 +86,7 @@ This system implements a **developmental reinforcement learning architecture** f
 - Uses `subprocess.run('echo "exe {cmd}" | yarp rpc /interactionInterface')`
 - Fire-and-forget pattern: no reply checking needed
 - 5-second timeout for command execution
-- Robust error handling and logging
-
+- 
 **3. Self-Adaptor Priority System**
 - Self-adaptors execute only when always-on is active
 - Random period between 60-120 seconds per cycle (1-2 minutes)
@@ -233,16 +232,6 @@ The system provides **real-time visual feedback** through a clean, intuitive con
 [Learner] 💾 Saved: Q=42, Gate=38
 [Learner] ✅ Shutdown complete
 ```
-
-### Benefits
-
-1. **Instant Comprehension**: Emoji status indicators allow quick visual scanning
-2. **Module Clarity**: Prefix shows which component is active
-3. **Reason Transparency**: Wait/abort messages explain why (threshold values, gaze missing, etc.)
-4. **Compact Format**: One-line messages avoid terminal clutter
-5. **State Visibility**: Context colors (🔵Calm, 🔴Lively), face/gaze counts (👤👁️)
-6. **Learning Progress**: Q-values, rewards, gatekeeper labels clearly visible
-
 ---
 
 ## Architecture
@@ -250,64 +239,64 @@ The system provides **real-time visual feedback** through a clean, intuitive con
 ### Module Interaction Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    EMBODIED BEHAVIOUR MODULE                     │
-│                                                                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ IIE Monitor  │  │Context Mon.  │  │ Info Monitor │          │
-│  │ (Intention)  │  │ (Calm/Lively)│  │ (Faces/Gaze) │          │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-│         └──────────────────┴──────────────────┘                  │
-│                         │                                         │
-│                    Shared State                                   │
-│              (IIE_mean, IIE_var, ctx,                            │
-│               num_faces, num_mutual_gaze)                         │
-│                         │                                         │
-│         ┌───────────────┴────────────────┐                       │
-│         │                                 │                       │
-│  ┌──────▼──────┐              ┌──────────▼─────┐                │
-│  │  Proactive  │              │ Self-Adaptor   │                │
-│  │   Thread    │              │    Thread      │                │
-│  │             │              │                │                │
-│  │ • Load Q    │              │ • ao_yawn      │                │
-│  │ • Select    │              │ • ao_cough     │                │
-│  │ • Execute   │              │ • ao_look      │                │
-│  │ • Measure   │              │   (periodic)   │                │
-│  └──────┬──────┘              └────────────────┘                │
-│         │                                                         │
-│         │ Experience Bottle                                      │
-│         │ (13 fields)                                            │
-└─────────┼─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                EMBODIED BEHAVIOUR MODULE                │
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │ IIE Monitor  │  │Context Mon.  │  │ Info Monitor │   │
+│  │ (Intention)  │  │ (Calm/Lively)│  │ (Faces/Gaze) │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+│         └─────────────────┴─────────────────┘           │
+│                           │                             │
+│                    Shared State                         │
+│              (IIE_mean, IIE_var, ctx,                   │
+│               num_faces, num_mutual_gaze)               │
+│                         │                               │
+│         ┌───────────────┴────────────────┐              │
+│         │                                │              │
+│  ┌──────▼──────┐              ┌──────────▼─────┐        │
+│  │  Proactive  │              │ Self-Adaptor   │        │
+│  │   Thread    │              │    Thread      │        │
+│  │             │              │                │        │
+│  │ • Load Q    │              │ • ao_yawn      │        │
+│  │ • Select    │              │ • ao_cough     │        │
+│  │ • Execute   │              │ • ao_look      │        │
+│  │ • Measure   │              │   (periodic)   │        │
+│  └──────┬──────┘              └────────────────┘        │
+│         │                                               │
+│         │ Experience Bottle                             │
+│         │ (13 fields)                                   │
+└─────────┼───────────────────────────────────────────────┘
           │
           │ YARP Port: /alwayson/embodiedbehaviour/experiences:o
           │
           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       LEARNING MODULE                            │
-│                                                                   │
+│                       LEARNING MODULE                           │
+│                                                                 │
 │  ┌────────────────────────────────────────────────────────────┐ │
-│  │            Experience Processing Pipeline                   │ │
+│  │            Experience Processing Pipeline                  │ │
 │  └────────────────────────────────────────────────────────────┘ │
-│         │                                                         │
-│         ▼                                                         │
+│         │                                                       │
+│         ▼                                                       │
 │  ┌─────────────┐         ┌──────────────┐                       │
 │  │ 1. PREDICT  │────────▶│ Log Pred vs  │                       │
 │  │ (ML Models) │         │   Actual     │                       │
 │  └─────────────┘         └──────────────┘                       │
-│         │                                                         │
-│         ▼                                                         │
+│         │                                                       │
+│         ▼                                                       │
 │  ┌─────────────┐         ┌──────────────┐                       │
 │  │ 2. COMPUTE  │────────▶│ Q-Learning   │                       │
 │  │   REWARD    │         │    Update    │                       │
 │  └─────────────┘         └──────┬───────┘                       │
-│                                  │                                │
-│                                  ▼                                │
-│                          ┌──────────────┐                        │
-│                          │ Save Q-table │                        │
-│                          │   (JSON)     │                        │
-│                          └──────────────┘                        │
-│         │                                                         │
-│         ▼                                                         │
+│                                 │                               │
+│                                 ▼                               │
+│                          ┌──────────────┐                       │
+│                          │ Save Q-table │                       │
+│                          │   (JSON)     │                       │
+│                          └──────────────┘                       │
+│         │                                                       │
+│         ▼                                                       │
 │  ┌─────────────┐         ┌──────────────┐                       │
 │  │ 3. TRAIN ML │────────▶│ Buffer (4x)  │                       │
 │  │   MODELS    │         │ Gatekeeper   │                       │
@@ -885,14 +874,6 @@ def _process_experience(exp):
     
     # WHY: Enable time delta calculation for next experience
 ```
-
-**Key Differences from Old Architecture**:
-- ❌ No prediction-before-training (gatekeeper learns from hindsight)
-- ❌ No regression models (binary classification only)
-- ❌ No action encoding (timing-based, not action-dependent)
-- ✓ Reward-based labeling (positive → YES cluster, negative → NO cluster)
-- ✓ Time-aware features (learns when to act, not just what happens)
-
 ---
 
 ## Communication Protocol
@@ -1607,75 +1588,6 @@ After collecting 200+ training samples and verifying gatekeeper convergence:
 - Model loading: ~5-10ms per decision (negligible vs 9s action cycle)
 - Prediction: ~1-2ms (GradientBoosting inference)
 - Total overhead: <15ms per action (~0.2% of cycle time)
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-#### 1. No Actions Executed
-**Symptoms**: Proactive thread never acts
-
-**Checks**:
-```python
-# Check thresholds:
-IIE_mean ≥ 0.5?
-IIE_var < 0.1?
-num_faces > 0?
-num_mutual_gaze > 0?
-alwayson_active == True?
-```
-
-**Solutions**:
-- Lower thresholds temporarily
-- Check IIE estimator output
-- Verify STM info bottle format
-
-#### 2. Q-Values Not Updating
-**Symptoms**: Q-table stays at 0.0
-
-**Checks**:
-```python
-# In Learning module:
-exp.pre_ctx != -1?
-exp.post_ctx != -1?
-reward != 0.0?
-```
-
-**Solutions**:
-- Check experience bottle format
-- Verify context is being detected
-- Check reward components
-
-#### 3. High Prediction Errors
-**Symptoms**: ML models not learning
-
-**Checks**:
-```python
-# In model_prediction_log.csv:
-prediction_error > 0.20 after 100 samples?
-```
-
-**Solutions**:
-- Check feature encoding
-- Verify StandardScaler is fitted
-- Increase buffer size or tree count
-
-#### 4. Always-On Stuck
-**Symptoms**: Won't start/stop
-
-**Checks**:
-```python
-# Check RPC interface:
-yarp rpc /interactionInterface
-exe ao_start  # Manual test
-```
-
-**Solutions**:
-- Verify interaction interface running
-- Check RPC command format
-- Review always-on monitor logs
 
 ---
 
