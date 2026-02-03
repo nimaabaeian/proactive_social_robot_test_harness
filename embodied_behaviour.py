@@ -611,7 +611,8 @@ class EmbodiedBehaviourModule(yarp.RFModule):
 
     def _parse_context(self, bottle: yarp.Bottle):
         if bottle.size() >= 3:
-            label = bottle.get(2).asInt32()
+            # Bottle structure: [Int32: episode_id] [Int32: chunk_id] [Int8: label]
+            label = bottle.get(2).asInt8()
             with self._lock:
                 self.context_label = label
 
