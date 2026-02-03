@@ -595,52 +595,18 @@ class DataPump(threading.Thread):
     def _publish_va(self, state: Dict, valence: float, arousal: float):
         """
         Publish valence/arousal.
-        Format: ((id <idx>)(class <name>)(score <conf>)(valence <v>)(arousal <a>)(box <x> <y> <w> <h>)(status ok))
+        Format: "PersonName1" <valence1> <arousal1> "PersonName2" <valence2> <arousal2> ...
         """
         bottle = self.va_port.prepare()
         bottle.clear()
         
-        for idx, face in enumerate(state['known_faces']):
-            va_list = bottle.addList()
-            
-            # id
-            i = va_list.addList()
-            i.addString("id")
-            i.addInt32(idx)
-            
-            # class
-            c = va_list.addList()
-            c.addString("class")
-            c.addString(face['name'])
-            
-            # score
-            s = va_list.addList()
-            s.addString("score")
-            s.addFloat64(face['confidence'])
-            
-            # valence
-            v = va_list.addList()
-            v.addString("valence")
-            v.addFloat64(valence)
-            
-            # arousal
-            a = va_list.addList()
-            a.addString("arousal")
-            a.addFloat64(arousal)
-            
-            # box (x, y, w, h format)
-            b = va_list.addList()
-            b.addString("box")
-            box = face['box']
-            b.addFloat64(box[0])  # x
-            b.addFloat64(box[1])  # y
-            b.addFloat64(box[2] - box[0])  # w
-            b.addFloat64(box[3] - box[1])  # h
-            
-            # status
-            st = va_list.addList()
-            st.addString("status")
-            st.addString("ok")
+        for face in state['known_faces']:
+            # Add person name as string
+            bottle.addString(face['name'])
+            # Add valence
+            bottle.addFloat64(valence)
+            # Add arousal
+            bottle.addFloat64(arousal)
         
         self.va_port.write()
     

@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 
 ACTION_RESPONSES = {
     "answer phone": ("speak", "Salutalo da parte mia"),
-    "carry/hold (an object)": ("speak", "Tieni forte"),
     "drink": ("speak", "Salute"),
     "eat": ("speak", "Buon appetito"),
     "text on/look at a cellphone": ("ao", "ao_yawn_phone"),

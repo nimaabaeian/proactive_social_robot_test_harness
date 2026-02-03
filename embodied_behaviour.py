@@ -30,7 +30,7 @@ BETA_REWARD = 0.3
 ETA_LEARNING = 0.1
 
 ALLOWED_ACTIONS = {
-    "answer phone", "carry/hold (an object)", "drink",
+    "answer phone", "drink",
     "eat", "text on/look at a cellphone", "hand wave",
 }
 
@@ -626,43 +626,34 @@ class EmbodiedBehaviourModule(yarp.RFModule):
     def _parse_va(self, bottle: yarp.Bottle):
         best_v, best_a, best_reward = None, None, -999.0
         
-        for i in range(bottle.size()):
-            face_item = bottle.get(i)
-            if not face_item.isList():
-                continue
-            face_list = face_item.asList()
-            v, a, status_ok = self._extract_va(face_list)
+        # Parse format: "PersonName1" <valence1> <arousal1> "PersonName2" <valence2> <arousal2> ...
+        i = 0
+        while i + 2 < bottle.size():
+            name_elem = bottle.get(i)
+            valence_elem = bottle.get(i + 1)
+            arousal_elem = bottle.get(i + 2)
             
-            if status_ok and v is not None and a is not None:
-                reward = compute_reward(v, a, ALPHA_REWARD, BETA_REWARD)
-                if reward > best_reward:
-                    best_reward = reward
-                    best_v = v
-                    best_a = a
+            # Extract values
+            try:
+                if name_elem.isString():
+                    name = name_elem.asString()
+                    v = valence_elem.asFloat64()
+                    a = arousal_elem.asFloat64()
+                    
+                    # Compute reward and track best
+                    reward = compute_reward(v, a, ALPHA_REWARD, BETA_REWARD)
+                    if reward > best_reward:
+                        best_reward = reward
+                        best_v = v
+                        best_a = a
+            except Exception as e:
+                print(f"[{self.module_name}] Error parsing VA data at index {i}: {e}")
+            
+            i += 3  # Move to next person's data
         
         with self._lock:
             if self._va_capturing and best_v is not None and best_a is not None:
                 self._va_samples.append((best_v, best_a, best_reward))
-
-    def _extract_va(self, face_list: yarp.Bottle) -> Tuple[Optional[float], Optional[float], bool]:
-        valence, arousal = None, None
-        status_ok = False
-        
-        for j in range(face_list.size()):
-            field = face_list.get(j)
-            if not field.isList():
-                continue
-            fl = field.asList()
-            if fl.size() < 2:
-                continue
-            key = fl.get(0).asString()
-            if key == "valence":
-                valence = fl.get(1).asFloat64()
-            elif key == "arousal":
-                arousal = fl.get(1).asFloat64()
-            elif key == "status":
-                status_ok = (fl.get(1).asString() == "ok")
-        return valence, arousal, status_ok
 
     def _face_id_reader(self):
         while self._running:
