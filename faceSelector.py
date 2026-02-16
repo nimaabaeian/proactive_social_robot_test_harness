@@ -119,6 +119,10 @@ class FaceSelectorModule(yarp.RFModule):
         self.module_name = "faceSelector"
         self.period = 0.05  # 20 Hz
         self._running = True
+        
+        # Error tracking
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = 10
 
         # RPC target names (configurable)
         self.interaction_manager_rpc_name = "/interactionManager"
@@ -163,6 +167,8 @@ class FaceSelectorModule(yarp.RFModule):
 
         # Configuration flags
         self.allow_ss5_selection = False  # By default, SS5 faces are not selected
+        self.verbose_debug = False  # Disable verbose DEBUG logs by default
+        self.ports_connected_logged = False  # Track if we've logged port connection status
 
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         """Configure module from ResourceFinder parameters."""
@@ -197,6 +203,9 @@ class FaceSelectorModule(yarp.RFModule):
             
             if rf.check("allow_ss5"):
                 self.allow_ss5_selection = rf.find("allow_ss5").asBool()
+            
+            if rf.check("verbose"):
+                self.verbose_debug = rf.find("verbose").asBool()
 
             # Open input ports
             self.landmarks_port = yarp.BufferedPortBottle()
@@ -310,6 +319,25 @@ class FaceSelectorModule(yarp.RFModule):
             return False
         
         try:
+            # Wait for input ports to be connected before processing
+            landmarks_connected = self.landmarks_port.getInputCount() > 0
+            img_connected = self.img_in_port.getInputCount() > 0
+            
+            if not landmarks_connected or not img_connected:
+                if not self.ports_connected_logged:
+                    self._log("INFO", "Waiting for input ports to be connected...")
+                    self._log("INFO", f"  landmarks_port: {'connected' if landmarks_connected else 'NOT connected'}")
+                    self._log("INFO", f"  img_port: {'connected' if img_connected else 'NOT connected'}")
+                    self._log("INFO", "Run: yarp connect /alwayson/vision/landmarks:o /faceSelector/landmarks:i")
+                    self._log("INFO", "Run: yarp connect /alwayson/vision/img:o /faceSelector/img:i")
+                    self.ports_connected_logged = True
+                return True
+            
+            # Log when ports become connected
+            if self.ports_connected_logged:
+                self._log("INFO", "✓ Input ports connected - starting processing")
+                self.ports_connected_logged = False
+            
             # Check if day has changed and prune if needed
             today = self._get_today_date()
             if self._current_day != today:
@@ -325,18 +353,18 @@ class FaceSelectorModule(yarp.RFModule):
             
             # 1. Read latest landmarks (non-blocking)
             faces = self._read_landmarks()
-            if faces:
+            if faces and self.verbose_debug:
                 self._log("DEBUG", f"Step 1/6: Read {len(faces)} face(s) from landmarks")
             
             # 2. Read latest image (non-blocking)
             frame = self._read_image()
-            if frame is not None:
+            if frame is not None and self.verbose_debug:
                 self._log("DEBUG", f"Step 2/6: Read image frame {frame.shape}")
             
             # 3. Compute states for all faces
             with self.state_lock:
                 self.current_faces = self._compute_face_states(faces)
-            if faces:
+            if faces and self.verbose_debug:
                 self._log("DEBUG", f"Step 3/6: Computed states for {len(self.current_faces)} face(s)")
             
             # 4. Select target face (if not busy with interaction)
@@ -361,10 +389,11 @@ class FaceSelectorModule(yarp.RFModule):
                             daemon=True
                         )
                         self.interaction_thread.start()
-                        self._log("DEBUG", "Step 4/6: Started interaction thread")
-                    else:
+                        if self.verbose_debug:
+                            self._log("DEBUG", "Step 4/6: Started interaction thread")
+                    elif self.verbose_debug:
                         self._log("DEBUG", "Step 4/6: No eligible face selected")
-                else:
+                elif self.verbose_debug:
                     self._log("DEBUG", "Step 4/6: Interaction busy, skipping selection")
             
             # 5. Annotate and publish image
@@ -373,21 +402,31 @@ class FaceSelectorModule(yarp.RFModule):
                     annotated = self._annotate_image(frame, self.current_faces, self.selected_target)
                 self.last_annotated_frame = annotated
                 self._publish_image(annotated)
-                self._log("DEBUG", "Step 5/6: Published annotated image")
+                if self.verbose_debug:
+                    self._log("DEBUG", "Step 5/6: Published annotated image")
             elif self.last_annotated_frame is not None:
                 # Republish last known frame if no new image
                 self._publish_image(self.last_annotated_frame)
             
             # 6. Publish debug info
             self._publish_debug()
-            self._log("DEBUG", "Step 6/6: Published debug info")
+            if self.verbose_debug:
+                self._log("DEBUG", "Step 6/6: Published debug info")
+            
+            # Reset error counter on success
+            self._consecutive_errors = 0
+            return True
             
         except Exception as e:
+            self._consecutive_errors += 1
             self._log("ERROR", f"Error in updateModule: {e}")
             import traceback
             traceback.print_exc()
-        
-        return True
+            
+            if self._consecutive_errors >= self._max_consecutive_errors:
+                self._log("CRITICAL", f"Too many consecutive errors ({self._consecutive_errors}), stopping module")
+                return False
+            return True
 
     # ==================== Landmark Parsing ====================
 
@@ -694,34 +733,40 @@ class FaceSelectorModule(yarp.RFModule):
             # Determine if known: check both current face_id and stable person_id
             is_known = self._is_face_known(face_id) or self._is_face_known(person_id)
             face["is_known"] = is_known
-            self._log("DEBUG", f"Face {face_id}: is_known={is_known}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: is_known={is_known}")
             
             # Check greeted today
             greeted_today = self._was_greeted_today(person_id, today)
             face["greeted_today"] = greeted_today
-            self._log("DEBUG", f"Face {face_id}: greeted_today={greeted_today}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: greeted_today={greeted_today}")
             
             # Check talked today
             talked_today = self._was_talked_today(person_id, today)
             face["talked_today"] = talked_today
-            self._log("DEBUG", f"Face {face_id}: talked_today={talked_today}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: talked_today={talked_today}")
             
             # Compute social state
             face["social_state"] = self._compute_social_state(is_known, greeted_today, talked_today)
             ss_name = self.SS_NAMES.get(face["social_state"], "?")
-            self._log("DEBUG", f"Face {face_id}: social_state={ss_name}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: social_state={ss_name}")
             
             # Get learning state
             face["learning_state"] = self._get_learning_state(person_id)
             ls_name = self.LS_NAMES.get(face["learning_state"], "?")
-            self._log("DEBUG", f"Face {face_id}: learning_state={ls_name}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: learning_state={ls_name}")
             
             # Check eligibility based on learning state and spatial state
             face["eligible"] = self._is_eligible(face)
             zone = face.get("zone", "?")
             dist = face.get("distance", "?")
             attn = face.get("attention", "?")
-            self._log("DEBUG", f"Face {face_id}: spatial=({zone}/{dist}/{attn}), eligible={face['eligible']}")
+            if self.verbose_debug:
+                self._log("DEBUG", f"Face {face_id}: spatial=({zone}/{dist}/{attn}), eligible={face['eligible']}")
         
         # Prune track_to_person to prevent unbounded growth
         active_tracks = {f["track_id"] for f in faces if f.get("track_id", -1) >= 0}
@@ -817,23 +862,31 @@ class FaceSelectorModule(yarp.RFModule):
         """Select best face based on priority rules."""
         # Filter to eligible faces only
         eligible = [f for f in faces if f.get("eligible", False)]
-        self._log("DEBUG", f"Selection: {len(eligible)}/{len(faces)} faces eligible")
+        if self.verbose_debug:
+            self._log("DEBUG", f"Selection: {len(eligible)}/{len(faces)} faces eligible")
         
         if not eligible:
-            # If no eligible faces and SS5 selection is disabled, check if we should allow SS5
+            # Only check SS5 fallback if explicitly allowed
             if not self.allow_ss5_selection:
-                # Try SS5 faces as last resort (configurable)
-                ss5_faces = [f for f in faces if f.get("social_state") == self.SS5]
-                if ss5_faces:
+                if self.verbose_debug:
+                    self._log("DEBUG", "Selection: No eligible faces, SS5 fallback disabled by config")
+                return None
+            
+            # Try SS5 faces as last resort (configurable)
+            ss5_faces = [f for f in faces if f.get("social_state") == self.SS5]
+            if ss5_faces:
+                if self.verbose_debug:
                     self._log("DEBUG", f"Selection: No eligible faces, checking {len(ss5_faces)} SS5 faces")
-                    # Still check spatial eligibility
-                    ss5_eligible = [f for f in ss5_faces if self._check_spatial_only(f)]
-                    if ss5_eligible:
+                # Still check spatial eligibility
+                ss5_eligible = [f for f in ss5_faces if self._check_spatial_only(f)]
+                if ss5_eligible:
+                    if self.verbose_debug:
                         self._log("DEBUG", f"Selection: {len(ss5_eligible)} SS5 faces spatially eligible")
-                        eligible = ss5_eligible
+                    eligible = ss5_eligible
             
             if not eligible:
-                self._log("DEBUG", "Selection: No faces available for interaction")
+                if self.verbose_debug:
+                    self._log("DEBUG", "Selection: No faces available for interaction")
                 return None
         
         # Sort by priority:
@@ -937,7 +990,7 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("INFO", "=== INTERACTION COMPLETE ===")
 
     def _execute_interaction_interface(self, command: str) -> bool:
-        """Execute a command on /interactionInterface via RPC."""
+        """Execute a command on /interactionInterface via RPC with timeout protection."""
         try:
             if self.interaction_interface_rpc.getOutputCount() == 0:
                 self._log("WARNING", f"RPC: interactionInterface not connected")
@@ -951,6 +1004,8 @@ class FaceSelectorModule(yarp.RFModule):
             
             self._log("DEBUG", f"RPC → interactionInterface: exe {command}")
             
+            # Note: YARP RPC has no native timeout, this could potentially hang
+            # Consider implementing a timeout mechanism using threading if needed
             if self.interaction_interface_rpc.write(cmd, reply):
                 self._log("DEBUG", f"RPC ← interactionInterface: {reply.toString()}")
                 return True
@@ -979,8 +1034,10 @@ class FaceSelectorModule(yarp.RFModule):
             reply = yarp.Bottle()
             
             self._log("DEBUG", f"RPC → interactionManager: {cmd.toString()}")
+            self._log("INFO", "RPC: Waiting for interaction to complete (this may take 1-2 minutes)...")
             
             # This call blocks until interaction completes
+            # Note: YARP RPC has no timeout mechanism, so this could hang if the server crashes
             if self.interaction_manager_rpc.write(cmd, reply):
                 self._log("DEBUG", f"RPC ← interactionManager: reply size={reply.size()}")
                 
@@ -1017,14 +1074,26 @@ class FaceSelectorModule(yarp.RFModule):
     def _process_interaction_result(self, result: Dict, target: Dict):
         """Process interaction result: update memory files and learning state."""
         try:
+            # Validate result structure
+            if not isinstance(result, dict):
+                self._log("ERROR", f"Invalid result type: {type(result)}")
+                return
+            
             success = result.get("success", False)
             final_state = result.get("final_state", "")
             steps = result.get("steps", [])
             
+            if not isinstance(steps, list):
+                self._log("ERROR", f"Invalid steps type: {type(steps)}")
+                steps = []
+            
             self._log("INFO", f"Processing result: success={success}, final_state={final_state}, steps={len(steps)}")
             
-            # Resolve person_id
+            # Resolve person_id with validation
             person_id = self._resolve_person_id(result, target)
+            if not person_id or person_id == "unknown":
+                self._log("WARNING", "Could not resolve valid person_id, using fallback")
+                person_id = f"track_{target.get('track_id', -1)}"
             self._log("INFO", f"Result: Resolved person_id = '{person_id}'")
             
             track_id = target["track_id"]
@@ -1057,27 +1126,36 @@ class FaceSelectorModule(yarp.RFModule):
                     self.greeted_today[person_id] = now_iso
                 if talked:
                     self.talked_today[person_id] = now_iso
+                # Capture snapshots under lock
+                greeted_snapshot = dict(self.greeted_today) if greeted else None
+                talked_snapshot = dict(self.talked_today) if talked else None
             
             # Save files outside lock (I/O can be slow)
-            if greeted:
-                self._save_greeted_json()
+            if greeted_snapshot:
+                self._save_greeted_json(greeted_snapshot)
                 self._log("INFO", f"Result: Saved greeted_today for '{person_id}'")
             
-            if talked:
-                self._save_talked_json()
+            if talked_snapshot:
+                self._save_talked_json(talked_snapshot)
                 self._log("INFO", f"Result: Saved talked_today for '{person_id}'")
             
             # Compute interaction score and update learning state
-            delta = self._compute_interaction_score(result)
-            self._log("INFO", f"Result: Interaction score delta = {delta:+d}")
-            
-            # Update learning state
-            self._update_learning_state(person_id, delta)
+            try:
+                delta = self._compute_interaction_score(result)
+                self._log("INFO", f"Result: Interaction score delta = {delta:+d}")
+                
+                # Update learning state
+                self._update_learning_state(person_id, delta)
+            except Exception as score_error:
+                self._log("ERROR", f"Failed to compute/update learning state: {score_error}")
+                # Continue anyway - at least memory files were saved
             
         except Exception as e:
             self._log("ERROR", f"Failed to process interaction result: {e}")
             import traceback
             traceback.print_exc()
+            # Ensure we don't leave the system in an inconsistent state
+            self._log("WARNING", "Interaction processing failed - state may be inconsistent")
 
     def _resolve_person_id(self, result: Dict, target: Dict) -> str:
         """Resolve the best person_id from interaction result."""
@@ -1279,17 +1357,20 @@ class FaceSelectorModule(yarp.RFModule):
         except Exception as e:
             self._log("ERROR", f"Failed to save {path}: {e}")
 
-    def _save_greeted_json(self):
-        """Save greeted_today.json."""
-        self._save_json_atomic(self.greeted_path, self.greeted_today)
+    def _save_greeted_json(self, data=None):
+        """Save greeted_today.json. If data provided, use it; else read self.greeted_today."""
+        save_data = data if data is not None else self.greeted_today
+        self._save_json_atomic(self.greeted_path, save_data)
 
-    def _save_talked_json(self):
-        """Save talked_today.json."""
-        self._save_json_atomic(self.talked_path, self.talked_today)
+    def _save_talked_json(self, data=None):
+        """Save talked_today.json. If data provided, use it; else read self.talked_today."""
+        save_data = data if data is not None else self.talked_today
+        self._save_json_atomic(self.talked_path, save_data)
 
-    def _save_learning_json(self):
-        """Save learning.json."""
-        data = {"people": self.learning_data}
+    def _save_learning_json(self, data=None):
+        """Save learning.json. If data provided, use it; else read self.learning_data."""
+        if data is None:
+            data = {"people": self.learning_data}
         self._save_json_atomic(self.learning_path, data)
 
     def _prune_to_today(self, d: Dict[str, str]) -> Dict[str, str]:
@@ -1394,6 +1475,7 @@ if __name__ == "__main__":
     print("  --talked_path <file>          (default: ./talked_today.json)")
     print("  --rate <seconds>              (default: 0.05)")
     print("  --allow_ss5 <true/false>      (default: false)")
+    print("  --verbose <true/false>        (default: false, enables DEBUG logs)")
     print()
     
     try:
