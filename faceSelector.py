@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,7 +90,7 @@ class FaceSelectorModule(yarp.RFModule):
         4: {"SO_CLOSE", "CLOSE"}
     }
     LS_VALID_ATTENTIONS = {
-        1: {"MUTUAL_GAZE", "NEAR_GAZE", "AWAY"},
+        1: {"MUTUAL_GAZE", "NEAR_GAZE", "AWAY", "UNKNOWN"},
         2: {"MUTUAL_GAZE", "NEAR_GAZE", "AWAY"},
         3: {"MUTUAL_GAZE", "NEAR_GAZE"},
         4: {"MUTUAL_GAZE"}
@@ -153,6 +154,14 @@ class FaceSelectorModule(yarp.RFModule):
         self.selected_bbox_last: Optional[Tuple[float, float, float, float]] = None  # Keep green box visible
         self.interaction_busy = False
         self.interaction_thread: Optional[threading.Thread] = None
+        
+        # Cooldown tracking to prevent rapid re-selection
+        self.last_interaction_time: Dict[str, float] = {}  # person_id -> timestamp
+        self.interaction_cooldown = 5.0  # seconds
+        
+        # Image processing optimization (skip frames if needed)
+        self.frame_skip_counter = 0
+        self.frame_skip_rate = 0  # 0 = process every frame (toBytes() is fast)
 
         # Memory caches (loaded from JSON files)
         self.greeted_today: Dict[str, str] = {}  # person_id -> ISO timestamp
@@ -356,10 +365,14 @@ class FaceSelectorModule(yarp.RFModule):
             if faces and self.verbose_debug:
                 self._log("DEBUG", f"Step 1/6: Read {len(faces)} face(s) from landmarks")
             
-            # 2. Read latest image (non-blocking)
-            frame = self._read_image()
-            if frame is not None and self.verbose_debug:
-                self._log("DEBUG", f"Step 2/6: Read image frame {frame.shape}")
+            # 2. Read latest image (non-blocking, skip frames to reduce overhead)
+            frame = None
+            self.frame_skip_counter += 1
+            if self.frame_skip_counter >= self.frame_skip_rate:
+                self.frame_skip_counter = 0
+                frame = self._read_image()
+                if frame is not None and self.verbose_debug:
+                    self._log("DEBUG", f"Step 2/6: Read image frame {frame.shape}")
             
             # 3. Compute states for all faces
             with self.state_lock:
@@ -368,29 +381,41 @@ class FaceSelectorModule(yarp.RFModule):
                 self._log("DEBUG", f"Step 3/6: Computed states for {len(self.current_faces)} face(s)")
             
             # 4. Select target face (if not busy with interaction)
+            current_time = time.time()
+            
             with self.state_lock:
                 if not self.interaction_busy:
                     candidate = self._select_best_face(self.current_faces)
                     if candidate:
-                        self.selected_target = candidate
-                        self.selected_bbox_last = candidate["bbox"]  # Store for green box persistence
-                        self.interaction_busy = True
+                        # Check cooldown for this person
+                        person_id = candidate.get("face_id", "unknown")
+                        last_interaction = self.last_interaction_time.get(person_id, 0)
                         
-                        face_id = candidate.get("face_id", "unknown")
-                        track_id = candidate.get("track_id", -1)
-                        ss = self.SS_NAMES.get(candidate.get("social_state", 0), "?")
-                        ls = self.LS_NAMES.get(candidate.get("learning_state", 1), "?")
-                        self._log("INFO", f"=== SELECTED TARGET: {face_id} (track={track_id}, {ss}, {ls}) ===")
-                        
-                        # Start interaction in background thread
-                        self.interaction_thread = threading.Thread(
-                            target=self._run_interaction_thread,
-                            args=(candidate,),
-                            daemon=True
-                        )
-                        self.interaction_thread.start()
-                        if self.verbose_debug:
-                            self._log("DEBUG", "Step 4/6: Started interaction thread")
+                        if current_time - last_interaction < self.interaction_cooldown:
+                            if self.verbose_debug:
+                                remaining = self.interaction_cooldown - (current_time - last_interaction)
+                                self._log("DEBUG", f"Step 4/6: {person_id} in cooldown ({remaining:.1f}s remaining)")
+                        else:
+                            self.selected_target = candidate
+                            self.selected_bbox_last = candidate["bbox"]  # Store for green box persistence
+                            self.interaction_busy = True
+                            self.last_interaction_time[person_id] = current_time
+                            
+                            face_id = candidate.get("face_id", "unknown")
+                            track_id = candidate.get("track_id", -1)
+                            ss = self.SS_NAMES.get(candidate.get("social_state", 0), "?")
+                            ls = self.LS_NAMES.get(candidate.get("learning_state", 1), "?")
+                            self._log("INFO", f"=== SELECTED TARGET: {face_id} (track={track_id}, {ss}, {ls}) ===")
+                            
+                            # Start interaction in background thread
+                            self.interaction_thread = threading.Thread(
+                                target=self._run_interaction_thread,
+                                args=(candidate,),
+                                daemon=True
+                            )
+                            self.interaction_thread.start()
+                            if self.verbose_debug:
+                                self._log("DEBUG", "Step 4/6: Started interaction thread")
                     elif self.verbose_debug:
                         self._log("DEBUG", "Step 4/6: No eligible face selected")
                 elif self.verbose_debug:
@@ -551,7 +576,7 @@ class FaceSelectorModule(yarp.RFModule):
     # ==================== Image Handling ====================
 
     def _read_image(self) -> Optional[np.ndarray]:
-        """Read image from YARP port (non-blocking) and return RGB numpy array (stride-safe)."""
+        """Read image from YARP port (non-blocking) and return RGB numpy array."""
         yimg = self.img_in_port.read(False)
         if not yimg:
             return None
@@ -560,30 +585,36 @@ class FaceSelectorModule(yarp.RFModule):
         if w <= 0 or h <= 0:
             return None
         
-        row = yimg.getRowSize()  # bytes per row (may include padding)
-        if row < w * 3:
-            self._log("WARNING", f"Image rowSize too small: row={row}, w*3={w*3}")
-            return None
+        # Update dimensions
+        self.img_width, self.img_height = w, h
         
-        # Use YARP's __array_interface__ to get numpy array directly
         try:
-            # Create numpy array from YARP image using array interface
-            img_array = np.asarray(yimg.__array_interface__)
-            if img_array.size == 0:
-                return None
+            # Try fast toBytes() method first (if available in YARP bindings)
+            try:
+                img_bytes = yimg.toBytes()
+                img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+                expected_size = h * w * 3
+                if len(img_array) >= expected_size:
+                    rgb = img_array[:expected_size].reshape((h, w, 3)).copy()
+                    return rgb
+            except AttributeError:
+                # toBytes() not available, fall through to pixel-by-pixel
+                pass
             
-            # Reshape to (height, rowSize) then extract valid pixels
-            raw = img_array.reshape((h, row))
-            rgb = raw[:, : w * 3].reshape((h, w, 3)).copy()
+            # Fallback: pixel-by-pixel copy (slower but works everywhere)
+            rgb = np.zeros((h, w, 3), dtype=np.uint8)
+            for y in range(h):
+                for x in range(w):
+                    pixel = yimg.pixel(x, y)
+                    rgb[y, x] = [pixel.r, pixel.g, pixel.b]
             
-            self.img_width, self.img_height = w, h
             return rgb
         except Exception as e:
             self._log("WARNING", f"Failed to convert YARP image to numpy: {e}")
             return None
 
     def _publish_image(self, frame_rgb: np.ndarray):
-        """Publish annotated image to YARP port (stride-safe)."""
+        """Publish annotated image to YARP port."""
         if self.img_out_port.getOutputCount() == 0:
             return
         
@@ -592,24 +623,21 @@ class FaceSelectorModule(yarp.RFModule):
             out = self.img_out_port.prepare()
             out.resize(w, h)
             
-            row = out.getRowSize()
-            if row < w * 3:
-                self._log("WARNING", f"Output rowSize too small: row={row}, w*3={w*3}")
-                return
-            
-            # Use YARP's __array_interface__ to write numpy array directly
+            # Try fast fromBytes() method first (if available in YARP bindings)
             try:
-                out_array = np.asarray(out.__array_interface__)
-                out_raw = out_array.reshape((h, row))
-                
-                # Write pixels; zero padding (optional but nice)
-                out_raw[:, : w * 3] = frame_rgb.reshape((h, w * 3))
-                if row > w * 3:
-                    out_raw[:, w * 3 :] = 0
-                
-                self.img_out_port.write()
-            except Exception as e:
-                self._log("WARNING", f"Failed to write numpy array to YARP image: {e}")
+                img_bytes = frame_rgb.tobytes()
+                out.fromBytes(img_bytes)
+            except AttributeError:
+                # fromBytes() not available, fall back to pixel-by-pixel
+                for y in range(h):
+                    for x in range(w):
+                        pixel = out.pixel(x, y)
+                        r, g, b = frame_rgb[y, x]
+                        pixel.r = int(r)
+                        pixel.g = int(g)
+                        pixel.b = int(b)
+            
+            self.img_out_port.write()
                 
         except Exception as e:
             self._log("WARNING", f"Failed to publish image: {e}")
