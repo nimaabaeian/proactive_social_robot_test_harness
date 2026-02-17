@@ -11,7 +11,7 @@ YARP Connections (run after starting):
     yarp connect /interactionManager/speech:o /acapelaSpeak/speech:i
 
 RPC Usage:
-    echo "run <track_id> <face_id> <ss1|ss2|ss3|ss4>" | yarp rpc /interactionManager
+    echo "run <track_id> <face_id> <ss1|ss2|ss3|ss4>" | yarp rpc /interactionManager/rpc
 """
 
 import glob
@@ -42,12 +42,13 @@ class InteractionManagerModule(yarp.RFModule):
     # Timeouts (seconds)
     TTS_TIMEOUT = 30.0
     STT_TIMEOUT = 10.0
+    SS4_STT_TIMEOUT = 15.0  # Longer timeout for conversation responses
     FILE_VERIFY_TIMEOUT = 5.0
     LLM_TIMEOUT = 60.0
     
     # SS4 limits
     SS4_MAX_TURNS = 5
-    SS4_MAX_TIME = 120.0
+    SS4_MAX_TIME = 180.0
     
     # Context labels
     CONTEXT_LABELS = {-1: "uncertain", 0: "calm", 1: "lively"}
@@ -65,8 +66,11 @@ class InteractionManagerModule(yarp.RFModule):
         self.run_lock = threading.Lock()
         self.log_buffer: List[Dict] = []
         
+        # Handle port for RPC (must be created before configure)
+        self.handle_port = yarp.Port()
+        self.attach(self.handle_port)
+        
         # YARP ports (initialized in configure)
-        # Note: RPC is built into RFModule, no separate rpc_port needed
         self.context_port: Optional[yarp.BufferedPortBottle] = None
         self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
         self.stt_port: Optional[yarp.BufferedPortBottle] = None
@@ -85,8 +89,12 @@ class InteractionManagerModule(yarp.RFModule):
             if rf.check("name"):
                 self.module_name = rf.find("name").asString()
             
-            # Set module name - RFModule handles RPC automatically via respond()
+            # Set module name
             self.setName(self.module_name)
+            
+            # Open RPC handle port
+            self.handle_port.open('/' + self.module_name)
+            self._log("INFO", f"RPC port opened at /{self.module_name}")
             
             # Create port objects as instance variables
             self.context_port = yarp.BufferedPortBottle()
@@ -117,6 +125,9 @@ class InteractionManagerModule(yarp.RFModule):
             # Initialize database
             self._init_db()
             
+            # Initialize Ollama LLM
+            self.ensure_ollama_and_model()
+            
             self._log("INFO", "InteractionManagerModule configured successfully")
             return True
             
@@ -129,6 +140,7 @@ class InteractionManagerModule(yarp.RFModule):
     def interruptModule(self) -> bool:
         """Interrupt all ports."""
         self._log("INFO", "Interrupting module...")
+        self.handle_port.interrupt()
         for port in [self.context_port, self.landmarks_port, 
                      self.stt_port, self.bookmark_port, self.speech_port]:
             if port:
@@ -138,6 +150,7 @@ class InteractionManagerModule(yarp.RFModule):
     def close(self) -> bool:
         """Close all ports."""
         self._log("INFO", "Closing module...")
+        self.handle_port.close()
         for port in [self.context_port, self.landmarks_port,
                      self.stt_port, self.bookmark_port, self.speech_port]:
             if port:
@@ -163,11 +176,28 @@ class InteractionManagerModule(yarp.RFModule):
             command = cmd.get(0).asString()
             self._log("DEBUG", f"RPC command received: {command}")
             
+            # Status/ping command for testing RPC connectivity
+            if command in ["status", "ping"]:
+                is_locked = not self.run_lock.acquire(blocking=False)
+                if not is_locked:
+                    self.run_lock.release()
+                return self._reply_ok(reply, {
+                    "success": True,
+                    "status": "ready",
+                    "module": self.module_name,
+                    "busy": is_locked
+                })
+            
             # Help command
             if command == "help":
                 return self._reply_ok(reply, {
                     "success": True,
-                    "commands": ["run <track_id> <face_id> <ss1|ss2|ss3|ss4>", "help", "quit"]
+                    "commands": [
+                        "run <track_id> <face_id> <ss1|ss2|ss3|ss4>",
+                        "status - check module status",
+                        "help - show commands",
+                        "quit - shutdown module"
+                    ]
                 })
             
             # Quit command
@@ -215,6 +245,13 @@ class InteractionManagerModule(yarp.RFModule):
             
         except Exception as e:
             self._log("ERROR", f"Exception in respond: {e}")
+            import traceback
+            traceback.print_exc()
+            # Make sure to release lock if we had acquired it
+            try:
+                self.run_lock.release()
+            except RuntimeError:
+                pass  # Lock wasn't acquired
             return self._reply_error(reply, str(e))
 
     def _reply_ok(self, reply: yarp.Bottle, data: Dict) -> bool:
@@ -471,7 +508,7 @@ class InteractionManagerModule(yarp.RFModule):
                     break
                 
                 self._log("INFO", f"SS4: Listening for user response (turn {result['turns']+1}/{self.SS4_MAX_TURNS})")
-                utterance = self.wait_user_utterance(self.STT_TIMEOUT)
+                utterance = self.wait_user_utterance(self.SS4_STT_TIMEOUT)
                 if not utterance:
                     self._log("INFO", "SS4: No response detected, ending conversation")
                     break
@@ -481,13 +518,22 @@ class InteractionManagerModule(yarp.RFModule):
                 user_responded = True
                 self._log("INFO", f"SS4 Turn {result['turns']}: User said: '{utterance}'")
                 
-                self._log("INFO", "SS4: Generating followup response using LLM")
-                followup = self._llm_generate_followup(utterance, result["user_responses"]) or "I see."
-                result["robot_utterances"].append(followup)
-                self._log("INFO", f"SS4: Robot responds: '{followup}'")
-                self._speak(followup)
-                self.wait_tts_end(self.TTS_TIMEOUT)
-                self._clear_stt_buffer()
+                # On last turn, generate acknowledgment without followup question
+                if result["turns"] < self.SS4_MAX_TURNS:
+                    self._log("INFO", "SS4: Generating followup response using LLM")
+                    followup = self._llm_generate_followup(utterance, result["user_responses"]) or "I see."
+                    result["robot_utterances"].append(followup)
+                    self._log("INFO", f"SS4: Robot responds: '{followup}'")
+                    self._speak(followup)
+                    self.wait_tts_end(self.TTS_TIMEOUT)
+                    self._clear_stt_buffer()
+                else:
+                    self._log("INFO", "SS4: Generating closing acknowledgment (no followup question)")
+                    closing = self._llm_generate_closing_acknowledgment(utterance) or "That's nice!"
+                    result["robot_utterances"].append(closing)
+                    self._log("INFO", f"SS4: Robot responds: '{closing}'")
+                    self._speak(closing)
+                    self.wait_tts_end(self.TTS_TIMEOUT)
             
             if user_responded:
                 result["success"] = True
@@ -607,53 +653,65 @@ class InteractionManagerModule(yarp.RFModule):
     def wait_user_utterance(self, timeout: float) -> Optional[str]:
         """Wait for STT output: [["text", "speaker"]]."""
         start = time.time()
+        check_count = 0
         while time.time() - start < timeout:
             bottle = self.stt_port.read(False)
+            check_count += 1
             if bottle and bottle.size() > 0:
+                self._log("DEBUG", f"STT bottle received: size={bottle.size()}, content='{bottle.toString()}'")
                 text = self._extract_stt_text(bottle)
                 if text and text.strip():
+                    self._log("DEBUG", f"STT text extracted: '{text}'")
                     return text.strip()
+                else:
+                    self._log("WARNING", f"STT bottle received but no text extracted")
             time.sleep(0.1)
+        self._log("DEBUG", f"wait_user_utterance timed out after {check_count} checks")
         return None
 
     def _extract_stt_text(self, bottle: yarp.Bottle) -> Optional[str]:
-        """Extract text from STT bottle format (handles 1-level and 2-level nesting)."""
+        """Extract text from STT bottle format: (\"text\" \"speaker\")."""
         try:
-            if bottle.size() == 0:
-                return None
-
-            first = bottle.get(0)
-
-            # Case A: first is a list
-            if first.isList():
-                inner = first.asList()
-                if not inner or inner.size() == 0:
-                    return None
-
-                # If inner[0] is itself a list: [[["text","speaker"]]]
-                inner0 = inner.get(0)
-                if inner0.isList():
-                    inner2 = inner0.asList()
-                    if inner2 and inner2.size() > 0:
-                        return inner2.get(0).asString()
-                    return None
-
-                # Normal: [["text","speaker"]]
-                return inner.get(0).asString()
-
-            # Case B: direct string
-            if first.isString():
-                return first.asString()
-
+            self._log("DEBUG", f"_extract_stt_text: bottle.size()={bottle.size()}")
+            if bottle.size() >= 1:
+                # The bottle contains a string representation: ("text" "speaker")
+                # When extracted via toString(), outer parens are stripped: "text" "speaker"
+                first_elem = bottle.get(0)
+                raw_string = first_elem.toString()
+                self._log("DEBUG", f"_extract_stt_text: raw_string='{raw_string}'")
+                
+                # Parse the string format after toString() strips outer parens
+                # Format 1: "text" "speaker" - text is quoted
+                if raw_string.startswith('"'):
+                    # Extract text between first pair of quotes
+                    end_idx = raw_string.find('"', 1)
+                    if end_idx > 1:
+                        text = raw_string[1:end_idx]
+                        self._log("DEBUG", f"_extract_stt_text: extracted text='{text}'")
+                        if text and text.strip():
+                            return text.strip()
+                # Format 2: text "" - text is not quoted, extract before ' ""'
+                elif ' ""' in raw_string:
+                    text = raw_string.split(' ""')[0].strip()
+                    self._log("DEBUG", f"_extract_stt_text: extracted text (unquoted)='{text}'")
+                    if text:
+                        return text
+                else:
+                    # Fallback: try asString() in case format changes
+                    text = first_elem.asString()
+                    if text and text.strip():
+                        return text.strip()
         except Exception as e:
             self._log("WARNING", f"STT parse failed: {e}")
-
         return None
 
     def _clear_stt_buffer(self):
         """Clear pending STT messages."""
+        cleared = 0
         while self.stt_port.read(False):
-            pass
+            cleared += 1
+        if cleared > 0:
+            self._log("DEBUG", f"Cleared {cleared} pending STT messages from buffer")
 
     def _clear_bookmark_buffer(self):
         """Clear pending bookmark messages."""
@@ -661,14 +719,9 @@ class InteractionManagerModule(yarp.RFModule):
             pass
 
     def ensure_stt_ready(self, language: str = "italian") -> bool:
-        """Configure and start STT module."""
-        try:
-            self._yarp_rpc("/speech2text/rpc", f"set {language}")
-            self._yarp_rpc("/speech2text/rpc", "start")
-            return True
-        except Exception as e:
-            self._log("ERROR", f"STT setup failed: {e}")
-            return False
+        """STT module should already be running - no RPC needed."""
+        self._log("INFO", "STT ready (no RPC configuration needed)")
+        return True
 
     # ==================== Speech Output ====================
 
@@ -1188,28 +1241,54 @@ JSON:'''
     def _llm_generate_ask_name(self) -> str:
         """Generate English question asking for name."""
         text = self._llm_request(
-            'Generate a short English question to ask someone their name. '
-            'Examples: "What is your name?", "May I have your name?" Output ONLY the question.'
+            'You are a friendly social robot having a natural conversation. '
+            'Ask the person for their name in a casual, warm way. '
+            'Be brief and natural like a human would ask. '
+            'Examples: "What\'s your name?", "I\'d love to know your name", "What should I call you?" '
+            'Output ONLY the question, no quotes or explanation.'
         )
-        return text.strip('"\'').strip() if text and len(text) < 100 else "What is your name?"
+        return text.strip('"\'').strip() if text and len(text) < 100 else "What's your name?"
 
     def _llm_generate_convo_starter(self) -> str:
-        """Generate English conversation starter."""
+        """Generate English conversation starter (not a greeting)."""
         text = self._llm_request(
-            'Generate a short, friendly English conversation starter. '
-            'Examples: "How are you doing today?", "How is your day going?" Output ONLY the sentence, under 15 words.'
+            'You are a friendly social robot continuing a conversation with someone you just greeted. '
+            'Generate a natural conversation starter. DO NOT use greetings like "hello" or "hi" since you already greeted them. '
+            'Ask about their day, wellbeing, or start a light topic. '
+            'Be brief, warm, and human-like. Under 15 words. '
+            'Examples: "How\'s your day going?", "What brings you here today?", "How are you doing?" '
+            'Output ONLY the sentence, no quotes.'
         )
-        return text.strip('"\'').strip() if text and len(text) < 150 else "How are you doing today?"
+        return text.strip('"\'').strip() if text and len(text) < 150 else "How's your day going?"
 
     def _llm_generate_followup(self, last_utterance: str, history: List[str]) -> str:
         """Generate English followup response."""
         history_text = "\n".join(f"- {u}" for u in history[-3:])
         text = self._llm_request(
-            f'You are having a friendly English conversation.\n'
-            f'User said: "{last_utterance}"\nRecent: {history_text}\n'
-            f'Generate a short English response (1 sentence, under 20 words). Output ONLY the response.'
+            f'You are a friendly social robot having a natural conversation with a human. '
+            f'Respond naturally and casually like a human would. '
+            f'Be empathetic, show interest, and keep it conversational. '
+            f'User just said: "{last_utterance}"\n'
+            f'Recent conversation: {history_text}\n'
+            f'Generate a brief, natural response (1-2 sentences, under 25 words). '
+            f'Sound human, not robotic. Use contractions. Be warm and engaging. '
+            f'Output ONLY your response, no quotes.'
         )
-        return text.strip('"\'').strip() if text and len(text) < 200 else "I see, interesting!"
+        return text.strip('"\'').strip() if text and len(text) < 200 else "That's interesting!"
+
+    def _llm_generate_closing_acknowledgment(self, last_utterance: str) -> str:
+        """Generate brief closing acknowledgment without questions."""
+        text = self._llm_request(
+            f'You are a friendly social robot ending a conversation. '
+            f'The person just said: "{last_utterance}"\n'
+            f'Generate a short, warm acknowledgment to close the conversation. '
+            f'DO NOT ask any questions or continue the conversation. '
+            f'Just acknowledge what they said in a positive, friendly way. '
+            f'Keep it very brief (under 10 words). Use natural, human-like language. '
+            f'Examples: "That\'s great!", "Nice talking with you!", "Sounds good!", "That\'s wonderful!" '
+            f'Output ONLY your acknowledgment, no quotes.'
+        )
+        return text.strip('"\'').strip() if text and len(text) < 100 else "That's nice!"
 
     # ==================== Helpers ====================
 
@@ -1228,14 +1307,18 @@ JSON:'''
     def _detect_greeting_response(self, result: Dict) -> bool:
         """Detect greeting response and update result."""
         self._clear_stt_buffer()
+        self._log("DEBUG", "Starting to listen for user utterance...")
         utterance = self.wait_user_utterance(self.STT_TIMEOUT)
         result["user_utterance"] = utterance
         
         if utterance:
+            self._log("INFO", f"Detected utterance: '{utterance}'")
             detection = self._llm_detect_greeting_response(utterance)
             result["response_detected"] = detection.get("responded", False)
             result["response_confidence"] = detection.get("confidence", 0.0)
             return result["response_detected"]
+        else:
+            self._log("WARNING", "No utterance detected during listening window")
         return False
 
     def _handle_error(self, result: Dict, state: str, error: Exception) -> Dict:
@@ -1381,16 +1464,17 @@ if __name__ == "__main__":
     print("  yarp connect /speech2text/text:o /interactionManager/stt:i")
     print("  yarp connect /acapelaSpeak/bookmark:o /interactionManager/acapela_bookmark:i")
     print("  yarp connect /interactionManager/speech:o /acapelaSpeak/speech:i")
-    print("Usage: echo \"run <track_id> <face_id> <ss1|ss2|ss3|ss4>\" | yarp rpc /interactionManager")
+    print()
+    print("RPC commands:")
+    print("  echo 'run <track_id> <face_id> <ss1|ss2|ss3|ss4>' | yarp rpc /interactionManager")
+    print("  echo 'status' | yarp rpc /interactionManager")
+    print("  echo 'help' | yarp rpc /interactionManager")
+    print("  echo 'quit' | yarp rpc /interactionManager")
+    print()
     
     try:
-        if module.configure(rf):
-            module.ensure_ollama_and_model()
-            while module.updateModule():
-                time.sleep(module.getPeriod())
-        else:
-            print("ERROR: Configuration failed")
-            sys.exit(1)
+        # Use runModule for proper YARP RFModule lifecycle
+        module.runModule(rf)
     except KeyboardInterrupt:
         print("\nInterrupted")
     finally:
