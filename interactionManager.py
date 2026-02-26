@@ -125,7 +125,7 @@ class InteractionManagerModule(yarp.RFModule):
     TARGET_LOST_TIMEOUT = 3.0  # seconds before declaring target lost
 
     # Responsive interactions
-    RESPONSIVE_GREET_REGEX = re.compile(r"^(hello|hi(?:\s+icub)?|ciao(?:\s+icub)?|good\s+morning)$")
+    RESPONSIVE_GREET_REGEX = re.compile(r"^(hello|hi|hey|ciao|buongiorno|good\s+morning)(?:\s+(?:icub|there|robot|friend))?$")
     RESPONSIVE_GREET_COOLDOWN_SEC = 10.0
     RESPONSIVE_ALLOWED_ATTENTION = {"MUTUAL_GAZE", "NEAR_GAZE"}
 
