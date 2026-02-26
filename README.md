@@ -1,183 +1,809 @@
-# Proactive Social Robot - Architecture Summary
+# Architecture Summary — `alwaysOn` Module
+> **Modules covered:** `faceSelector.py` · `interactionManager.py`
+> **Platform:** YARP (Yet Another Robot Platform)  
+> **Robot:** iCub / any YARP-compatible robot  
+> **Language:** Python 3  
+> **Last updated:** 2026-02-26
 
-## System Overview
+---
 
-This system implements a **proactive social robot** using the iCub
-humanoid robot platform. The robot autonomously detects people, analyzes
-their social context, and initiates appropriate interactions based on a
-state machine that tracks social relationships and learning progress.
+## Table of Contents
 
-### Core Philosophy
+1. [Overview](#1-overview)
+2. [System Block Diagram](#2-system-block-diagram)
+3. [Module: `faceSelector`](#3-module-faceselector)
+   - [Purpose](#31-purpose)
+   - [YARP Ports](#32-yarp-ports)
+   - [State Model](#33-state-model)
+   - [Main Loop — updateModule()](#34-main-loop--updatemodule)
+   - [Face Selection Policy](#35-face-selection-policy)
+   - [Interaction Trigger Flow](#36-interaction-trigger-flow)
+   - [Reward & Learning State Updates](#37-reward--learning-state-updates)
+   - [Background Threads](#38-background-threads)
+   - [Persistent Data Files](#39-persistent-data-files)
+   - [SQLite Logging](#310-sqlite-logging)
+   - [Image Annotation & Visualization](#311-image-annotation--visualization)
+4. [Module: `interactionManager`](#4-module-interactionmanager)
+   - [Purpose](#41-purpose)
+   - [YARP Ports](#42-yarp-ports)
+   - [State Trees (Interaction Flows)](#43-state-trees-interaction-flows)
+   - [SS1 — Unknown Person](#44-ss1--unknown-person)
+   - [SS2 — Known, Not Greeted](#45-ss2--known-not-greeted)
+   - [SS3 — Known, Greeted, Not Talked](#46-ss3--known-greeted-not-talked)
+   - [Hunger / QR Feeding Tree](#47-hunger--qr-feeding-tree)
+   - [Target Monitor](#48-target-monitor)
+   - [Responsive Interaction Path](#49-responsive-interaction-path)
+   - [LLM Integration (Ollama)](#410-llm-integration-ollama)
+   - [Speech Output (TTS)](#411-speech-output-tts)
+   - [STT (Speech-to-Text) Input](#412-stt-speech-to-text-input)
+   - [HungerModel](#413-hungermodel)
+   - [RPC Interface](#414-rpc-interface)
+   - [Database](#415-database)
+5. [Cross-Module Data Flow](#5-cross-module-data-flow)
+6. [State Transition Diagrams](#6-state-transition-diagrams)
+   - [Social State Machine](#61-social-state-machine)
+   - [Learning State Machine](#62-learning-state-machine)
+7. [Threading Architecture](#7-threading-architecture)
+8. [Memory Files Reference](#8-memory-files-reference)
+9. [Key Constants Reference](#9-key-constants-reference)
+10. [YARP Connection Commands](#10-yarp-connection-commands)
 
--   **Proactive Engagement**: Robot initiates interactions rather than
-    waiting for user commands
--   **Social State Tracking**: Maintains memory of past interactions
-    (known/unknown, greeted today, talked today)
--   **Adaptive Learning**: Progressive spatial constraints (Learning
-    States LS1--LS4) ensure quality interactions
--   **Real-Time Robustness**: Non-blocking architecture with monitored
-    interaction execution
+---
 
-------------------------------------------------------------------------
+## 1. Overview
 
-## System Architecture
+The `alwaysOn` system implements a **developmental social interaction architecture** for the iCub robot. It continuously monitors who is in front of the robot, selects the most prominent person (biggest bounding box), and determines what kind of social interaction to initiate — ranging from first contact with an unknown person all the way to casual conversation with a familiar face.
 
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                         YARP Network                             │
-    └─────────────────────────────────────────────────────────────────┘
-               │                    │                    │
-               ▼                    ▼                    ▼
-        ┌────────────┐      ┌──────────────┐    ┌─────────────────┐
-        │ perception │      │ faceSelector │    │ interaction     │
-        │  (Vision)  │─────▶│  (Decision)  │───▶│   Manager       │
-        └────────────┘      └──────────────┘    │  (Execution)    │
-               │                    │            └─────────────────┘
-               │                    │                     │
-               ▼                    ▼                     ▼
-        ┌────────────┐      ┌──────────────┐    ┌─────────────────┐
-        │ MediaPipe  │      │ JSON State   │    │  LLM (Ollama)   │
-        │ Face Mesh  │      │   Storage    │    │   Phi-3 mini    │
-        └────────────┘      └──────────────┘    └─────────────────┘
+The architecture has two tightly coupled modules:
 
-------------------------------------------------------------------------
+| Module | Role |
+|---|---|
+| **`faceSelector`** | Vision-side brain — watches faces, computes social/spatial/learning context, selects a target, and triggers interactions via RPC |
+| **`interactionManager`** | Interaction brain — executes state-tree-based social dialogues using LLM, STT, TTS, and YARP behaviours |
 
-## Component Breakdown
+They communicate through a **YARP RPC call**: `faceSelector` sends `run <track_id> <face_id> <state>` to `interactionManager`, which executes the full interaction and returns a **compact JSON result**.
 
-### 1. perception.py - Vision Analyzer Module
+---
 
-**Purpose**: Real-time face detection, tracking, landmark extraction,
-and gaze analysis.
+## 2. System Block Diagram
 
-**Responsibilities**: - Detect faces and assign `track_id` - Resolve
-`face_id` (known name or temporary code) - Compute bounding boxes
-`(x, y, w, h)` - Estimate head pose (pitch, yaw, roll) - Compute
-attention (`MUTUAL_GAZE`, `NEAR_GAZE`, `AWAY`) - Detect talking
-behavior - Estimate zone and distance categories - Publish structured
-YARP bottle
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║                        YARP NETWORK                                  ║
+║                                                                      ║
+║  /alwayson/vision/landmarks:o ─────────────────────────┐            ║
+║                                                         ▼            ║
+║  /icub/camcalib/left/out ──────────► [  faceSelector  ]             ║
+║                                             │                        ║
+║                                   (RPC: run track face ss)           ║
+║                                             │                        ║
+║                                             ▼                        ║
+║                                    [ interactionManager ]            ║
+║                                       │         │                    ║
+║                                       │         ▼                    ║
+║  /speech2text/text:o ─────────────────┘  /interactionManager/speech:o
+║                                                  │                   ║
+║  /icub/cam/left ──► camLeft:i (QR)               ▼                   ║
+║                                          /acapelaSpeak/speech:i      ║
+║                                                                      ║
+║  /interactionInterface ◄── RPC (ao_start, ao_stop, exe <behaviour>) ║
+║  /objectRecognition    ◄── RPC (name <name> id <track_id>)          ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
 
-Output is consumed by both `faceSelector` and `interactionManager`.
+---
 
-------------------------------------------------------------------------
+## 3. Module: `faceSelector`
 
-### 2. faceSelector.py - Face Selection & Decision Module
+### 3.1 Purpose
 
-**Purpose**: Select target face (biggest bounding box), compute Social
-State (SS) and Learning State (LS), manage AO start/stop, and trigger
-interactions.
+`faceSelector` is the **perception and selection layer**. It:
+- Reads raw face landmark data from the vision system
+- Parses Social State (SS), Learning State (LS), distance, attention, and bounding box per face
+- Selects **one target**: always the face with the **biggest bounding box**
+- Waits for that face's identity (`face_id`) to be resolved before proceeding
+- Checks eligibility gates (cooldown, LS constraints, SS state)
+- Fires off an interaction thread that calls `interactionManager` via RPC
+- Processes the interaction result to update learning states and social memory
+
+### 3.2 YARP Ports
+
+| Port | Type | Direction | Purpose |
+|---|---|---|---|
+| `/faceSelector/landmarks:i` | BufferedPortBottle | IN | Face landmark data from vision |
+| `/faceSelector/img:i` | BufferedPortImageRgb | IN | Camera image for annotation |
+| `/faceSelector/img:o` | BufferedPortImageRgb | OUT | Annotated camera image |
+| `/faceSelector/debug:o` | Port | OUT | Debug status bottle |
+| `/faceSelector/interactionManager:rpc` | RpcClient | OUT | Trigger interactions |
+| `/faceSelector/interactionInterface:rpc` | RpcClient | OUT | Send `ao_start`/`ao_stop` signals |
+
+### 3.3 State Model
 
 #### Social States (SS)
 
-  State   Meaning
-  ------- -----------------------------------------
-  SS1     Unknown
-  SS2     Known, not greeted today
-  SS3     Known, greeted today, not talked
-  SS4     Known, greeted today, talked (terminal)
+| State | Meaning | Condition |
+|---|---|---|
+| `ss1` | **Unknown** | `face_id` not recognized |
+| `ss2` | **Known, Not Greeted** | Known person, not greeted today |
+| `ss3` | **Known, Greeted, No Talk** | Known, greeted today, no conversation yet |
+| `ss4` | **Known, Greeted, Talked** | Full interaction completed today (no further action) |
 
-"Greeted today" and "Talked today" apply only to known persons.
+```
+is_known? ─── NO ──────────────────► ss1
+              │
+             YES
+              ├── greeted_today? ─── NO ──► ss2
+              │
+             YES
+              ├── talked_today? ─── NO ──► ss3
+              │
+             YES ────────────────────────► ss4  (no-op)
+```
 
 #### Learning States (LS)
 
-LS1--LS4 progressively restrict zone, distance, and attention
-requirements.\
-Eligibility is enforced before triggering interaction.
+| State | Description | Distance allowed | Attention required |
+|---|---|---|---|
+| `LS1` | Early — strict constraints | `SO_CLOSE`, `CLOSE` | `MUTUAL_GAZE` only |
+| `LS2` | Developing — relaxed | `SO_CLOSE`, `CLOSE`, `FAR` | `MUTUAL_GAZE`, `NEAR_GAZE` |
+| `LS3` | Advanced — no constraints | Any | Any |
 
-#### Selection Logic
+LS values are **per-person** and stored in `learning.json`. They evolve via **reward shaping** after each interaction.
 
-1.  Parse all faces.
-2.  Compute SS and LS.
-3.  Select **biggest bounding box face** (with small stability guard).
-4.  Trigger interaction only if:
-    -   Not busy
-    -   Not in cooldown
-    -   LS spatial gate satisfied
-    -   Social state not SS4
+#### Eligibility Check (`_is_eligible`)
 
-#### AO Behaviour
+A face is eligible for interaction if:
+- It is **not** `ss4`
+- If `LS3` → always eligible
+- If `LS1` or `LS2` → must satisfy distance AND attention constraints for that LS level
 
--   If at least one face exists → `ao_start` (edge-triggered)
--   If no faces → `ao_stop` (edge-triggered)
+### 3.4 Main Loop — `updateModule()`
 
-#### Persistence
+Runs at **20 Hz** (period = 0.05 s). Steps each cycle:
 
--   `learning.json`
--   `greeted_today.json`
--   `talked_today.json`
--   `last_greeted.json`
--   `faceSelector.db` (async logging)
+```
+1. Check ports connected (landmarks + img). Wait if not.
+2. Day-change check → prune greeted_today / talked_today if new day
+3. _read_landmarks()     → parse face bottles from YARP
+4. _read_image()         → get camera frame (with frame skip)
+5. _compute_face_states()→ enrich each face with SS, LS, eligibility, last_greeted_ts
+6. _select_biggest_face()→ find face with max bbox area
 
-------------------------------------------------------------------------
+   IF face_id NOT resolved (still "recognizing"/"unmatched") → WAIT, do not fall back
 
-### 3. interactionManager.py - Interaction Execution Module
+   IF resolved AND not in cooldown:
+     └─ IF eligible AND ss != ss4:
+          → set interaction_busy = True
+          → start _run_interaction_thread(candidate)
 
-**Purpose**: Execute interaction trees in real time using LLM +
-monitored abort logic.
+7. Annotate & publish image
+8. Publish debug bottle
+```
 
-#### Interaction Trees
+### 3.5 Face Selection Policy
 
-SS1 (Unknown) - Execute `ao_hi` - Wait response - Ask name (retry
-once) - Extract name (LLM) - Say "Nice to meet you `<name>`{=html}" -
-Register via objectRecognition RPC - Update `last_greeted`
+> **Rule:** Always pick the biggest bbox. Never fall back to a smaller resolved face.
 
-SS2 (Known, Not Greeted) - Say "Hi `<name>`{=html}\` - Wait response
-(retry once) - On success → chain into SS3
+```python
+biggest = max(faces, key=lambda f: f['bbox'][2] * f['bbox'][3])
 
-SS3 (Known, Greeted, Not Talked) - Max 3-turn short conversation - Turn
-1: Starter - Turn 2: Follow-up - Turn 3: Closing acknowledgment (no
-question) - At least one user response → success
+if not _is_face_id_resolved(biggest['face_id']):
+    # wait — do not switch to a different face
+    return  
 
-SS4 is terminal and does not execute a tree.
+# Proceed with the biggest resolved face
+```
 
-#### Real-Time Safeguards
+**Cooldown key logic:**
+- Known person → key = `person_id` (e.g., `"Alice"`)
+- Unknown person → key = `f"unknown:{track_id}"`
+- Cooldown duration: **5.0 seconds** between interactions with the same person
 
--   TargetMonitor thread aborts if:
-    -   Target disappears
-    -   Another face becomes biggest
--   STT waiting is interruptible
--   LLM calls include retry logic
--   Only one interaction runs at a time (run_lock)
+### 3.6 Interaction Trigger Flow
 
-#### Logging
+```
+_run_interaction_thread(target)
+  ├─ Check if interactionManager is already busy → skip if yes
+  ├─ Skip if ss4
+  ├─ _execute_interaction_interface("ao_start") → signal the robot body
+  ├─ _run_interaction_manager(track_id, face_id, ss)
+  │     └─ RPC: "run <track_id> <face_id> <ss>"
+  │     └─ Returns compact JSON result
+  ├─ _process_interaction_result(result, target)
+  │     ├─ Update greeted_today / talked_today
+  │     ├─ Update track_to_person mapping
+  │     ├─ Compute reward delta
+  │     └─ Update learning state (LS)
+  └─ _execute_interaction_interface("ao_stop")
+  
+  [finally]
+  └─ interaction_busy = False
+  └─ Update cooldown timestamp
+```
 
--   `interaction_data.db` (async WAL logging)
--   Full JSON result contract returned to faceSelector
+### 3.7 Reward & Learning State Updates
 
-------------------------------------------------------------------------
+#### Reward Computation (`_compute_reward`)
 
-## Data Flow
+| Scenario | Reward |
+|---|---|
+| Success + name extracted | `+2` |
+| Success (no name) | `+1` |
+| Failure: `not_responded` | `-1` |
+| Failure: `face_disappeared` (first time in 30s window) | `-1` |
+| Failure: `face_disappeared` (repeated ≥ 2 times in 30s) | `-2` |
+| Other failure | `-1` |
 
-Perception → faceSelector → interactionManager → faceSelector → Learning
-update
+#### Learning State Update (`_update_learning_state`)
 
-------------------------------------------------------------------------
+```
+delta > 0  →  new_ls = min(3, current_ls + 1)   (advance)
+delta < 0  →  new_ls = max(1, current_ls - 1)   (regress)
+delta = 0  →  no change
+```
 
-## Performance
+Changes are logged to SQLite (`ls_changes` table) and persisted to `learning.json`.
 
--   faceSelector: \~20 Hz
--   interactionManager: 1 Hz control loop
--   SS3: max 3 turns, max 120 seconds
--   All DB writes async
--   RPC calls protected with timeout
+#### Face Disappear Penalty Tracking
 
-------------------------------------------------------------------------
+Uses a **sliding window** per person:
+- Window: 30 seconds
+- Threshold: 2 events
+- Below threshold → mild penalty (`-1`)
+- At/above threshold → harsh penalty (`-2`)
 
-## Dependencies
+### 3.8 Background Threads
 
--   yarp-python
--   ollama (Phi-3 mini)
--   sqlite3 (stdlib)
+| Thread | Function | Purpose |
+|---|---|---|
+| `_io_thread` | `_io_worker()` | Drains `_io_queue` → saves JSON files asynchronously |
+| `_db_thread` | `_db_worker()` | Drains `_db_queue` → writes SQLite records |
+| `_lg_refresh_thread` | `_last_greeted_refresh_loop()` | Re-reads `last_greeted.json` every 0.2s (5 Hz) |
+| `interaction_thread` | `_run_interaction_thread()` | Spawned per interaction, runs the RPC call |
 
-------------------------------------------------------------------------
+### 3.9 Persistent Data Files
 
-## File Structure
+| File | Content | Format |
+|---|---|---|
+| `memory/learning.json` | Per-person LS values + updated_at | `{"people": {"Alice": {"ls": 2, "updated_at": "..."}}}` |
+| `memory/greeted_today.json` | ISO timestamps of today's greetings | `{"Alice": "2026-02-26T09:30:00+01:00"}` |
+| `memory/talked_today.json` | ISO timestamps of today's conversations | `{"Alice": "2026-02-26T09:35:00+01:00"}` |
+| `memory/last_greeted.json` | Latest greeted entry per person | `{"Alice": {"timestamp": "...", "track_id": 3, ...}}` |
 
-    proactive_social_robot/
-    ├── faceSelector.py
-    ├── interactionManager.py
-    ├── README.md
-    ├── learning.json
-    ├── greeted_today.json
-    ├── talked_today.json
-    ├── faceSelector.db
-    ├── interaction_data.db
-    └── last_greeted.json
+All writes are **atomic** (written to a temp file then `os.replace()`).
+
+### 3.10 SQLite Logging
+
+**Database:** `data_collection/face_selector.db`
+
+| Table | Logged event | Key columns |
+|---|---|---|
+| `target_selections` | Every target selected | `track_id`, `face_id`, `person_id`, `bbox_area`, `ss`, `ls`, `eligible` |
+| `ss_changes` | Social state transitions | `person_id`, `old_ss`, `new_ss` |
+| `ls_changes` | Learning state transitions | `person_id`, `old_ls`, `new_ls`, `reward_delta` |
+
+### 3.11 Image Annotation & Visualization
+
+Every face is drawn with:
+- **Green box** → currently active interaction target
+- **Yellow box** → eligible (ready for interaction)
+- **White box** → present but not eligible
+
+Labels drawn above each box:
+```
+Alice (T:3)                    ← person_id + track_id
+ss2 | LS2 | LG:09:30           ← social state, learning state, last greeted time
+CLOSE/MUT                      ← distance / attention (3-char)
+area=12400                     ← bbox area in pixels²
+```
+
+Status overlay (top-left): `Status: BUSY | Faces: 2`
+
+---
+
+## 4. Module: `interactionManager`
+
+### 4.1 Purpose
+
+`interactionManager` is the **dialogue and behavior execution layer**. It:
+- Receives RPC commands from `faceSelector` (`run <track_id> <face_id> <state>`)
+- Executes the appropriate **social state tree** (SS1/SS2/SS3)
+- Uses **Ollama LLM** for natural language generation and name extraction
+- Listens to **STT** for user responses
+- Sends **TTS speech** through YARP
+- Continuously monitors if the target face is still the biggest (abort if not)
+- Handles **responsive interactions** (user-initiated greetings, QR feeding)
+- Manages the robot's **hunger model**
+
+### 4.2 YARP Ports
+
+| Port | Type | Direction | Purpose |
+|---|---|---|---|
+| `/interactionManager` | Port (RPC) | IN | Main RPC handle (run / status / quit) |
+| `/interactionManager/landmarks:i` | BufferedPortBottle | IN | Face data for target monitoring |
+| `/interactionManager/stt:i` | BufferedPortBottle | IN | Speech-to-text transcripts |
+| `/interactionManager/speech:o` | Port | OUT | TTS text → Acapela speaker |
+| `/interactionManager/camLeft:i` | BufferedPortImageRgb | IN | Camera for QR code reading |
+
+**Lazy RPC Clients (created on first use):**
+
+| Client connects to | Purpose |
+|---|---|
+| `/interactionInterface` | Send `exe <behaviour>` commands (ao_start, ao_stop, ao_hi, ...) |
+| `/objectRecognition` | Submit `name <name> id <track_id>` for face labeling |
+
+### 4.3 State Trees (Interaction Flows)
+
+The module supports 4 social states. Only SS1–SS3 have active trees:
+
+| State | Tree | What happens |
+|---|---|---|
+| `ss1` | `_run_ss1_tree` | Greet unknown → ask name → extract name → register |
+| `ss2` | `_run_ss2_tree` | Greet by name → wait response → chain to SS3 |
+| `ss3` | `_run_ss3_tree` | Proactive conversation starter → up to 3 turns |
+| `ss4` | no-op | Immediately returns success |
+
+**Hunger override:** If hunger state is `HS3` (starving), or `HS2` + `ss3`, the **hunger feed tree** runs instead of the social tree.
+
+### 4.4 SS1 — Unknown Person
+
+```
+┌─────────────────────────────────────────────────────┐
+│ SS1: Unknown Person                                 │
+│                                                     │
+│  ① Run behaviour: ao_hi                             │
+│  ② Wait STT response (10s)                          │
+│      └─ No response → ABORT: no_response_greeting   │
+│  ③ Say "We have not met, what's your name?"         │
+│  ④ Wait STT response (10s)                          │
+│      └─ No response → ABORT: no_response_name       │
+│  ⑤ Extract name (regex + LLM fallback)              │
+│      └─ Fail → Say "Sorry, I didn't catch that"     │
+│            └─ Retry once                            │
+│            └─ Fail → ABORT: name_extraction_failed  │
+│  ⑥ Register name via /objectRecognition RPC         │
+│  ⑦ Write last_greeted.json                          │
+│  ⑧ Say "Nice to meet you"                           │
+│                                                     │
+│  Result: success=True, final_state=ss3              │
+└─────────────────────────────────────────────────────┘
+```
+
+**Name extraction pipeline:**
+1. **Fast regex:** patterns like `"My name is X"`, `"I'm X"`, `"Call me X"`
+2. **LLM fallback:** structured JSON prompt to Ollama with schema validation
+
+### 4.5 SS2 — Known, Not Greeted
+
+```
+┌─────────────────────────────────────────────────────┐
+│ SS2: Known, Not Greeted                             │
+│                                                     │
+│  ① Say "Hello <name>"    (attempt 1)                │
+│  ② Wait STT response (10s)                          │
+│      └─ Responded → write last_greeted              │
+│              → final_state=ss3                      │
+│              → chain to _run_ss3_tree()             │
+│      └─ No response → retry once                    │
+│  ③ Say "Hello <name>"    (attempt 2)                │
+│  ④ Wait STT response (10s)                          │
+│      └─ Responded → chain to ss3                   │
+│      └─ No response → ABORT: no_response_greeting   │
+└─────────────────────────────────────────────────────┘
+```
+
+Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
+
+### 4.6 SS3 — Known, Greeted, Not Talked
+
+```
+┌─────────────────────────────────────────────────────┐
+│ SS3: Short Conversation (max 3 turns, max 120s)     │
+│                                                     │
+│  ① Use cached LLM-generated starter question         │
+│     (pre-fetched in background, e.g. "How's your   │
+│      day going?")                                   │
+│  ② Say the starter                                  │
+│  ③ Schedule next background starter prefetch        │
+│                                                     │
+│  Loop (up to 3 turns):                              │
+│    ├─ Wait STT response (12s)                       │
+│    │    └─ No response → end loop                   │
+│    ├─ Turn 1 or 2: LLM generate follow-up           │
+│    ├─ Turn 3 (last): LLM generate closing ack       │
+│    └─ Say robot's reply                             │
+│                                                     │
+│  ≥1 response → talked=True, final_state=ss4        │
+│  0 responses → ABORT: no_response_conversation      │
+└─────────────────────────────────────────────────────┘
+```
+
+### 4.7 Hunger / QR Feeding Tree
+
+Triggered when `HungerModel` reports the robot is hungry/starving. Overrides the social tree.
+
+```
+Hunger States:
+  HS1: level ≥ 60%   (satisfied)
+  HS2: 25% ≤ level < 60%  (hungry)
+  HS3: level < 25%   (starving)
+
+Trigger conditions:
+  HS3 → always replaces SS1/SS2/SS3
+  HS2 + ss3 → replaces SS3
+
+Flow:
+  ① Say "I'm so hungry, would you feed me please?"
+  Loop:
+    ├─ Wait for QR scan event (8s timeout)
+    ├─ Fed → say "Yummy, thank you so much."
+    │        → if HS1 → break (satisfied)
+    │        → else → say "I'm still hungry. Give me more."
+    └─ Timeout → execute timeout behaviour (e.g., "right_there")
+  
+  QR Mapping:
+    SMALL_MEAL  → +10 hunger
+    MEDIUM_MEAL → +25 hunger
+    LARGE_MEAL  → +45 hunger
+
+  Result: success if ≥1 meal eaten; final_state unchanged (no ss promotion)
+```
+
+The **QR reader** runs in its own daemon thread (`_qr_reader_loop`), reading from `/interactionManager/camLeft:i` at ~50fps using `cv2.QRCodeDetector`.
+
+### 4.8 Target Monitor
+
+A dedicated thread runs **alongside every interaction** (at 15 Hz) checking that the interaction target remains:
+1. **Still visible** in the landmarks stream
+2. **Still the biggest-bbox face**
+
+```
+_target_monitor_loop(track_id, result):
+  Loop at 15 Hz:
+    ├─ Parse latest landmarks
+    ├─ Find face with track_id
+    ├─ If found:
+    │    └─ If another face is now biggest → ABORT: target_not_biggest
+    └─ If not found:
+         └─ Wait TARGET_LOST_TIMEOUT (3.0s)
+         └─ Still missing → ABORT: target_lost
+```
+
+**Starvation guard:** If the monitor thread was blocked for >1.5s (GIL starvation), it resets its lost-timer silently to avoid false aborts.
+
+Abort reasons cascade: the monitor sets `abort_event`, which every STT wait loop, speak-and-wait, and LLM future poll checks.
+
+### 4.9 Responsive Interaction Path
+
+The responsive path handles **user-initiated events** that arise independently of the proactive cycle:
+
+#### Responsive Greeting
+- **Trigger:** User says `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (matched by regex)
+- **Condition:** Exactly **one** face visible with `MUTUAL_GAZE` or `NEAR_GAZE`, known name
+- **Cooldown:** 10 seconds per name
+- **Action:** Say `"Hi <name>"` + write `last_greeted`
+
+#### Responsive QR Acknowledgment
+- **Trigger:** QR scan detected (outside of a proactive interaction)
+- **Action:** Say `"yummy, thank you"`
+
+**Safety:** Responsive interactions are **dropped** (not deferred) if a proactive interaction is running. The `run_lock` and `_responsive_active` event prevent any concurrency conflicts.
+
+### 4.10 LLM Integration (Ollama)
+
+**Model:** `llama3.2:3b` (configurable via `LLM_MODEL`)  
+**Endpoint:** `http://localhost:11434/api/generate` (non-streaming)  
+**HTTP Timeout:** `min(LLM_TIMEOUT, 10.0)` = 10 seconds per request  
+**Retries:** 3 attempts with 1s delay
+
+| LLM Function | Purpose | Key params |
+|---|---|---|
+| `_llm_generate_convo_starter` | One short open question | temp=0.4, max_tokens=40 |
+| `_llm_generate_followup` | Natural follow-up response (1-2 sentences) | temp=0.5, max_tokens=80 |
+| `_llm_generate_closing_acknowledgment` | Warm closing (≤10 words) | temp=0.4, max_tokens=30 |
+| `_llm_extract_name` | JSON name extraction with schema | temp=0, max_tokens=80 |
+
+**LLM thread pool:** Single-worker `ThreadPoolExecutor` — one LLM call at a time.  
+Futures are polled with `_await_future_abortable()` which checks `abort_event` every 100ms and can cancel the future early.
+
+**Startup:** On `configure()`, the module:
+1. Checks if Ollama binary exists (falls back to auto-install)
+2. Starts/verifies the Ollama server
+3. Pulls `llama3.2:3b` if not present
+4. Pre-fetches a conversation starter in the background
+
+### 4.11 Speech Output (TTS)
+
+```python
+_speak(text)          → writes Bottle to /interactionManager/speech:o
+_speak_and_wait(text) → speak() + estimated wait based on word count
+```
+
+**Wait estimation:**
+```
+wait = word_count / 3.0 + 0.5   (words_per_second=3.0, end_margin=0.5)
+wait = clamp(wait, 1.0, 8.0)
+```
+
+During `speak_and_wait`, the abort event is checked every 100ms so the robot can be interrupted mid-speech.
+
+### 4.12 STT (Speech-to-Text) Input
+
+Reads from `/interactionManager/stt:i` (connected to `/speech2text/text:o`).
+
+```python
+_wait_user_utterance_abortable(timeout):
+  Loop until timeout:
+    ├─ Check abort_event → return None if set
+    ├─ Read stt_port (non-blocking)
+    ├─ If text → return stripped text
+    └─ sleep 0.1s
+    
+    GIL compensation: if loop body took >0.5s, extend timeout by that amount
+```
+
+**Buffer clearing** (`_clear_stt_buffer`): Done before each expected utterance to discard stale transcripts.
+
+### 4.13 HungerModel
+
+Simulates the robot's "hunger" as a level from 0–100:
+
+```python
+HungerModel(drain_hours=6.0, hungry_threshold=60.0, starving_threshold=25.0)
+
+update()  → decrements level based on elapsed time (drains to 0 in drain_hours)
+feed(delta, payload) → increments level (capped at 100)
+get_state() → "HS1" (≥60), "HS2" (≥25), "HS3" (<25)
+```
+
+Thread-safe via internal `_lock`. Updated every `updateModule()` cycle (1 Hz).
+
+### 4.14 RPC Interface
+
+The module exposes an RPC handle at `/interactionManager`.
+
+**Supported commands:**
+
+| Command | Arguments | Returns |
+|---|---|---|
+| `run` | `<track_id> <face_id> <ss1\|ss2\|ss3\|ss4>` | Compact JSON result |
+| `status` / `ping` | — | `{"success":true, "busy":<bool>, ...}` |
+| `help` | — | Command list |
+| `quit` | — | Shutdown |
+
+**Concurrency:** `run_lock` (non-blocking acquire) ensures only one interaction runs at a time. If busy, returns `{"error": "Another action is running"}`.
+
+**Compact result format (returned to faceSelector):**
+```json
+{
+  "success": true,
+  "track_id": 3,
+  "name": "Alice",
+  "name_extracted": true,
+  "abort_reason": null,
+  "initial_state": "ss1",
+  "final_state": "ss3",
+  "interaction_tag": "SS1HS1",
+  "hunger_state_start": "HS1",
+  "hunger_state_end": "HS1",
+  "stomach_level_start": 85.2,
+  "stomach_level_end": 85.1
+}
+```
+
+**Abort reason compaction:**
+- `target_lost` / `target_not_biggest` / `target_monitor_abort` → `"face_disappeared"`
+- Anything else → `"not_responded"`
+
+### 4.15 Database
+
+**File:** `data_collection/interaction_manager.db`
+
+| Table | What it stores |
+|---|---|
+| `interactions` | Full record of every proactive interaction: states, success, abort, transcript |
+| `responsive_interactions` | Responsive greeting and QR feed events |
+
+A background `_db_thread` drains the `_db_queue` to avoid blocking the interaction thread.
+
+---
+
+## 5. Cross-Module Data Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      Complete Interaction Cycle                      │
+│                                                                      │
+│  1. Vision → /landmarks:o                                            │
+│       │                                                              │
+│       ▼                                                              │
+│  2. faceSelector._read_landmarks()                                   │
+│       → parse face_id, track_id, bbox, distance, attention          │
+│                                                                      │
+│  3. faceSelector._compute_face_states()                              │
+│       → SS (ss1/ss2/ss3/ss4)                                         │
+│       → LS (1/2/3 from learning.json)                               │
+│       → eligibility check                                           │
+│       → last_greeted_ts from last_greeted.json                      │
+│                                                                      │
+│  4. faceSelector._select_biggest_face()                              │
+│       → biggest bbox, resolved face_id, not in cooldown, eligible   │
+│                                                                      │
+│  5. faceSelector → RPC → interactionManager                          │
+│       "run <track_id> <face_id> <ss>"                               │
+│                                                                      │
+│  6. interactionManager._execute_interaction()                        │
+│       → launch target monitor thread                                 │
+│       → run appropriate SS tree                                      │
+│       → LLM calls (background thread pool)                          │
+│       → STT waits (main thread)                                      │
+│       → TTS outputs (/speech:o)                                      │
+│       → behaviour commands (/interactionInterface RPC)               │
+│       → name registration (/objectRecognition RPC)                   │
+│                                                                      │
+│  7. interactionManager → compact JSON result → faceSelector          │
+│                                                                      │
+│  8. faceSelector._process_interaction_result()                       │
+│       → update greeted_today.json / talked_today.json               │
+│       → compute reward delta                                         │
+│       → update LS in learning.json                                  │
+│       → log SS change + LS change to face_selector.db               │
+│       → reset interaction_busy, update cooldown                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 6. State Transition Diagrams
+
+### 6.1 Social State Machine
+
+```
+         [ss1: Unknown]
+              │
+      Greet + Ask Name + Extract Name + Register
+              │   Success
+              ▼
+         [ss2: Known, Not Greeted]
+           ↗  ↑ (next day — daily reset of greeted_today)
+              │
+         Say "Hi <name>" + Response received
+              │   Success
+              ▼
+         [ss3: Known, Greeted, No Talk]
+              │
+         Conversation (≥1 user turn)
+              │   Success
+              ▼
+         [ss4: Known, Greeted, Talked]    ← TERMINAL (today)
+              │
+         (next day reset → back to ss2)
+```
+
+### 6.2 Learning State Machine
+
+```
+         [LS1: Strict]
+         ·  SO_CLOSE or CLOSE
+         ·  MUTUAL_GAZE only
+              │ reward +1 or +2
+              ▼
+         [LS2: Relaxed]
+         ·  Any distance except VERY_FAR
+         ·  MUTUAL_GAZE or NEAR_GAZE
+              │ reward +1 or +2
+              ▼
+         [LS3: Advanced]
+         ·  No constraints
+         ·  Always eligible
+
+         Any state: reward -1 or -2 → regress one level (min LS1)
+         Any state: reward +1 or +2 → advance one level (max LS3)
+```
+
+---
+
+## 7. Threading Architecture
+
+### `faceSelector` Threads
+
+```
+Main thread (updateModule @ 20Hz)
+├── _io_thread           → JSON file saves (queue-driven)
+├── _db_thread           → SQLite writes (queue-driven)
+├── _lg_refresh_thread   → last_greeted.json re-read (5Hz loop)
+└── interaction_thread   → spawned per interaction
+      └── (wait for interactionManager RPC, then process result)
+```
+
+### `interactionManager` Threads
+
+```
+Main thread (updateModule @ 1Hz) → hunger.update()
+RPC handle thread                → respond() (YARP managed)
+├── _landmarks_reader_thread     → continuously parses /landmarks:i
+├── _db_thread                   → async SQLite writes
+├── _qr_reader_thread            → camera QR scanning (50fps)
+├── _responsive_thread           → watches STT for user-initiated greetings
+└── [per interaction]:
+      ├── _monitor_thread        → target monitor (15Hz)
+      ├── LLM future             → single-slot ThreadPoolExecutor
+      └── behaviour threads      → ao_hi, ao_start, ao_stop (fire-and-forget)
+```
+
+**Locks & Events:**
+
+| Primitive | Purpose |
+|---|---|
+| `state_lock` (faceSelector) | Protect `current_faces`, `interaction_busy`, `last_interaction_time`, etc. |
+| `_last_greeted_lock` (faceSelector) | Protect `_last_greeted_snapshot` for background refresh |
+| `run_lock` (interactionManager) | Mutual exclusion for interaction execution |
+| `abort_event` (interactionManager) | Signal abort to all interaction sub-steps |
+| `_responsive_active` (interactionManager) | Prevent overlap of responsive + proactive |
+| `_feed_condition` (interactionManager) | Condition variable for QR feed notification |
+| `_faces_lock` (interactionManager) | Protect `_latest_faces` shared with monitor |
+
+---
+
+## 8. Memory Files Reference
+
+All files under `modules/alwaysOn/memory/`:
+
+| File | R/W | Owner | Description |
+|---|---|---|---|
+| `learning.json` | R+W | faceSelector | LS per person, `{"people": {"Alice": {"ls": 2, "updated_at": "..."}}}` |
+| `greeted_today.json` | R+W | faceSelector + interactionManager | ISO timestamps of today's greetings |
+| `talked_today.json` | R+W | faceSelector | ISO timestamps of today's talks |
+| `last_greeted.json` | R+W | interactionManager (write) / faceSelector (read) | Last greeting record per person |
+
+---
+
+## 9. Key Constants Reference
+
+### `faceSelector`
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `period` | 0.05s | Main loop rate (20 Hz) |
+| `interaction_cooldown` | 5.0s | Minimum time between interactions with same person |
+| `DISAPPEAR_WINDOW_SEC` | 30.0s | Window for counting face_disappeared events |
+| `DISAPPEAR_THRESHOLD` | 2 | Events before harsh penalty kicks in |
+| `frame_skip_rate` | 0 | Process every frame (0 = no skip) |
+
+### `interactionManager`
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `period` | 1.0s | Main loop (hunger update) |
+| `SS1_STT_TIMEOUT` | 10.0s | Wait for greeting response (SS1) |
+| `SS2_STT_TIMEOUT` | 10.0s | Wait for name response (SS1) |
+| `SS2_GREET_TIMEOUT` | 10.0s | Wait for greeting response (SS2) |
+| `SS3_STT_TIMEOUT` | 12.0s | Wait per conversation turn (SS3) |
+| `SS3_MAX_TURNS` | 3 | Maximum conversation turns |
+| `SS3_MAX_TIME` | 120.0s | Max total SS3 conversation time |
+| `LLM_TIMEOUT` | 60.0s | Maximum LLM wait |
+| `MONITOR_HZ` | 15.0 | Target monitor polling rate |
+| `TARGET_LOST_TIMEOUT` | 3.0s | Grace period before declaring target lost |
+| `RESPONSIVE_GREET_COOLDOWN_SEC` | 10.0s | Per-name cooldown for reactive greetings |
+| `TTS_WORDS_PER_SECOND` | 3.0 | Used to estimate speech duration |
+
+---
+
+## 10. YARP Connection Commands
+
+```bash
+# faceSelector
+yarp connect /alwayson/vision/landmarks:o  /faceSelector/landmarks:i
+yarp connect /icub/camcalib/left/out       /faceSelector/img:i
+# (faceSelector auto-connects its RPC ports to interactionManager)
+
+# interactionManager
+yarp connect /alwayson/vision/landmarks:o  /interactionManager/landmarks:i
+yarp connect /speech2text/text:o           /interactionManager/stt:i
+yarp connect /icub/cam/left                /interactionManager/camLeft:i
+yarp connect /interactionManager/speech:o  /acapelaSpeak/speech:i
+
+# RPC test
+echo "status" | yarp rpc /interactionManager
+echo "run 3 Alice ss2" | yarp rpc /interactionManager
+```
