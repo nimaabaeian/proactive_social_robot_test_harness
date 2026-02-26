@@ -1,11 +1,9 @@
-# Architecture Summary — `alwaysOn` Module
-> **Modules covered:** `faceSelector.py` · `interactionManager.py`
+# Always On Cognitive Architecture — `Embodied Behaviour` 
+> **Modules:** `faceSelector.py` · `interactionManager.py`
 > **Platform:** YARP (Yet Another Robot Platform)  
-> **Robot:** iCub / any YARP-compatible robot  
-> **Language:** Python 3  
-> **Last updated:** 2026-02-26
-
----
+> **Robot:** iCub
+> **Author:** Nima Abaeian
+--
 
 ## Table of Contents
 
@@ -52,17 +50,12 @@
 
 ## 1. Overview
 
-The `alwaysOn` system implements a **developmental social interaction architecture** for the iCub robot. It continuously monitors who is in front of the robot, selects the most prominent person (biggest bounding box), and determines what kind of social interaction to initiate — ranging from first contact with an unknown person all the way to casual conversation with a familiar face.
+The`Embodied Behaviour` Module in the `AlwaysOn Cognitive Architecture` system implements a **adaptive social interaction architecture** for the iCub robot. 
 
-The architecture has two tightly coupled modules:
+The Embodied Behaviour has two tightly coupled modules:
 
-| Module | Role |
-|---|---|
-| **`faceSelector`** | Vision-side brain — watches faces, computes social/spatial/learning context, selects a target, and triggers interactions via RPC |
-| **`interactionManager`** | Interaction brain — executes state-tree-based social dialogues using LLM, STT, TTS, and YARP behaviours |
-
-They communicate through a **YARP RPC call**: `faceSelector` sends `run <track_id> <face_id> <state>` to `interactionManager`, which executes the full interaction and returns a **compact JSON result**.
-
+| **`faceSelector`** |
+| **`interactionManager`** |
 ---
 
 ## 2. System Block Diagram
@@ -381,19 +374,19 @@ The module supports 4 social states. Only SS1–SS3 have active trees:
 ┌─────────────────────────────────────────────────────┐
 │ SS1: Unknown Person                                 │
 │                                                     │
-│  ① Run behaviour: ao_hi                             │
-│  ② Wait STT response (10s)                          │
+│  ① Run behaviour: ao_hi                            │
+│  ② Wait STT response (10s)                         │
 │      └─ No response → ABORT: no_response_greeting   │
-│  ③ Say "We have not met, what's your name?"         │
-│  ④ Wait STT response (10s)                          │
+│  ③ Say "We have not met, what's your name?"        │
+│  ④ Wait STT response (10s)                         │
 │      └─ No response → ABORT: no_response_name       │
-│  ⑤ Extract name (regex + LLM fallback)              │
+│  ⑤ Extract name (regex + LLM fallback)             │
 │      └─ Fail → Say "Sorry, I didn't catch that"     │
 │            └─ Retry once                            │
 │            └─ Fail → ABORT: name_extraction_failed  │
-│  ⑥ Register name via /objectRecognition RPC         │
-│  ⑦ Write last_greeted.json                          │
-│  ⑧ Say "Nice to meet you"                           │
+│  ⑥ Register name via /objectRecognition RPC        │
+│  ⑦ Write last_greeted.json                         │
+│  ⑧ Say "Nice to meet you"                          │
 │                                                     │
 │  Result: success=True, final_state=ss3              │
 └─────────────────────────────────────────────────────┘
@@ -409,15 +402,15 @@ The module supports 4 social states. Only SS1–SS3 have active trees:
 ┌─────────────────────────────────────────────────────┐
 │ SS2: Known, Not Greeted                             │
 │                                                     │
-│  ① Say "Hello <name>"    (attempt 1)                │
-│  ② Wait STT response (10s)                          │
+│  ① Say "Hello <name>"    (attempt 1)               │
+│  ② Wait STT response (10s)                         │
 │      └─ Responded → write last_greeted              │
 │              → final_state=ss3                      │
 │              → chain to _run_ss3_tree()             │
 │      └─ No response → retry once                    │
-│  ③ Say "Hello <name>"    (attempt 2)                │
-│  ④ Wait STT response (10s)                          │
-│      └─ Responded → chain to ss3                   │
+│  ③ Say "Hello <name>"    (attempt 2)               │
+│  ④ Wait STT response (10s)                         │
+│      └─ Responded → chain to ss3                    │
 │      └─ No response → ABORT: no_response_greeting   │
 └─────────────────────────────────────────────────────┘
 ```
@@ -428,13 +421,13 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ SS3: Short Conversation (max 3 turns)                │
+│ SS3: Short Conversation (max 3 turns)               │
 │                                                     │
-│  ① Use cached LLM-generated starter question         │
-│     (pre-fetched in background, e.g. "How's your   │
+│  ① Use cached LLM-generated starter question       │
+│     (pre-fetched in background, e.g. "How's your    │
 │      day going?")                                   │
-│  ② Say the starter                                  │
-│  ③ Schedule next background starter prefetch        │
+│  ② Say the starter                                 │
+│  ③ Schedule next background starter prefetch       │
 │                                                     │
 │  Loop (up to 3 turns):                              │
 │    ├─ Wait STT response (12s)                       │
@@ -443,7 +436,7 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 │    ├─ Turn 3 (last): LLM generate closing ack       │
 │    └─ Say robot's reply                             │
 │                                                     │
-│  ≥1 response → talked=True, final_state=ss4        │
+│  ≥1 response → talked=True, final_state=ss4         │
 │  0 responses → ABORT: no_response_conversation      │
 └─────────────────────────────────────────────────────┘
 ```
@@ -643,45 +636,26 @@ A background `_db_thread` drains the `_db_queue` to avoid blocking the interacti
 ## 5. Cross-Module Data Flow
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                      Complete Interaction Cycle                      │
-│                                                                      │
-│  1. Vision → /landmarks:o                                            │
-│       │                                                              │
-│       ▼                                                              │
-│  2. faceSelector._read_landmarks()                                   │
-│       → parse face_id, track_id, bbox, distance, attention          │
-│                                                                      │
-│  3. faceSelector._compute_face_states()                              │
-│       → SS (ss1/ss2/ss3/ss4)                                         │
-│       → LS (1/2/3 from learning.json)                               │
-│       → eligibility check                                           │
-│       → last_greeted_ts from last_greeted.json                      │
-│                                                                      │
-│  4. faceSelector._select_biggest_face()                              │
-│       → biggest bbox, resolved face_id, not in cooldown, eligible   │
-│                                                                      │
-│  5. faceSelector → RPC → interactionManager                          │
-│       "run <track_id> <face_id> <ss>"                               │
-│                                                                      │
-│  6. interactionManager._execute_interaction()                        │
-│       → launch target monitor thread                                 │
-│       → run appropriate SS tree                                      │
-│       → LLM calls (background thread pool)                          │
-│       → STT waits (main thread)                                      │
-│       → TTS outputs (/speech:o)                                      │
-│       → behaviour commands (/interactionInterface RPC)               │
-│       → name registration (/objectRecognition RPC)                   │
-│                                                                      │
-│  7. interactionManager → compact JSON result → faceSelector          │
-│                                                                      │
-│  8. faceSelector._process_interaction_result()                       │
-│       → update greeted_today.json / talked_today.json               │
-│       → compute reward delta                                         │
-│       → update LS in learning.json                                  │
-│       → log SS change + LS change to face_selector.db               │
-│       → reset interaction_busy, update cooldown                      │
-└──────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│              Complete Interaction Cycle (Proactive + Responsive)      │
+│                                                                       │
+│  A) Proactive Path (faceSelector-driven)                              │
+│  1. Vision landmarks/image → faceSelector                             │
+│  2. faceSelector parses faces + computes SS/LS/eligibility            │
+│  3. faceSelector selects biggest resolved face (cooldown-aware)       │
+│  4. faceSelector → RPC run(track_id, face_id, ss) → interactionMgr    │
+│  5. interactionManager executes tree (SS or hunger-feed override),    │
+│     with monitor + STT/TTS + behaviors + optional name registration   │
+│  6. interactionManager returns compact JSON result                    │
+│  7. faceSelector updates memory/LS/cooldown + DB logs                 │
+│                                                                       │
+│  B) Responsive Path (interactionManager internal, event-driven)       │
+│  R1. STT greeting or QR feed event detected                           │
+│  R2. If proactive interaction is running (run_lock busy) → DROP event │
+│  R3. If idle → run responsive greeting or responsive QR acknowledgment│
+│  R4. Execute behaviors + speech, update greeting memory when needed   │
+│  R5. Log event in responsive_interactions DB table                    │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
