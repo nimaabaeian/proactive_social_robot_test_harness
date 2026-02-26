@@ -68,29 +68,59 @@ They communicate through a **YARP RPC call**: `faceSelector` sends `run <track_i
 ## 2. System Block Diagram
 
 ```
-╔══════════════════════════════════════════════════════════════════════╗
-║                        YARP NETWORK                                  ║
-║                                                                      ║
-║  /alwayson/vision/landmarks:o ─────────────────────────┐            ║
-║                                                         ▼            ║
-║  /icub/camcalib/left/out ──────────► [  faceSelector  ]             ║
-║                                             │                        ║
-║                                   (RPC: run track face ss)           ║
-║                                             │                        ║
-║                                             ▼                        ║
-║                                    [ interactionManager ]            ║
-║                                       │         │                    ║
-║                                       │         ▼                    ║
-║  /speech2text/text:o ─────────────────┘  /interactionManager/speech:o
-║                                                  │                   ║
-║  /icub/cam/left ──► camLeft:i (QR)               ▼                   ║
-║                                          /acapelaSpeak/speech:i      ║
-║                                                                      ║
-║  /interactionInterface ◄── RPC (ao_start, ao_stop, exe <behaviour>) ║
-║  /objectRecognition    ◄── RPC (name <name> id <track_id>)          ║
-╚══════════════════════════════════════════════════════════════════════╝
-```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      alwaysOn Architecture                           │
+└──────────────────────────────────────────────────────────────────────┘
 
+      Perception (faces, image)                     User inputs
+                 │                                  (speech, QR)
+                 │                                        │
+                 v                                        │
+┌──────────────────────────────────────────────────────────────────────┐
+│ faceSelector                                                         │
+│ - Parse face observations (id, bbox, attention, distance)            │
+│ - Compute Social State (SS) and Learning State (LS)                  │
+│ - Apply eligibility + cooldown rules                                 │
+│ - Select biggest-bbox face as the active target                      │
+│ - Trigger proactive interaction and update learning/memory           │
+└──────────────────────────────────────────────────────────────────────┘
+                 │
+                 │ RPC call: run(track_id, face_id, ss)
+                 v
+┌──────────────────────────────────────────────────────────────────────┐
+│ interactionManager                                                   │
+│ - Run interaction trees (SS1/SS2/SS3; SS4 no-op)                     │
+│ - Run hunger feed tree (HS override) with QR feeding events          │
+│ - Monitor target continuity (still visible + still biggest)          │
+│ - Use LLM for name extraction and conversation generation            │
+│ - Coordinate STT/TTS + behavior execution                            │
+│ - Handle responsive greetings/QR acknowledgments when proactive idle │
+│ - Drive robot actions (speech + behaviors)                           │
+└──────────────────────────────────────────────────────────────────────┘
+                 │
+                 │ compact JSON result (success, final_state, abort...)
+                 └──────────────────────────────► back to faceSelector
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ State Machines                                                       │
+│ - SS (Social): ss1 / ss2 / ss3 / ss4                                 │
+│   computed in faceSelector, executed in interactionManager trees     │
+│ - LS (Learning): LS1 <-> LS2 <-> LS3                                 │
+│   maintained in faceSelector via reward updates                      │
+│ - HS (Hunger): HS1 <-> HS2 <-> HS3                                   │
+│   maintained in interactionManager (can override social tree)        │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ Shared Memory + Logs                                                 │
+│ - JSON memory (learning, greeted/talked, last_greeted)               │
+│ - SQLite logs (faceSelector + interactionManager records)            │
+└──────────────────────────────────────────────────────────────────────┘
+faceSelector ─────────────── read/write ───────────────┐
+                                                        ├── memory
+interactionManager ───────── read/write ───────────────┘
+
+```
 ---
 
 ## 3. Module: `faceSelector`
@@ -278,7 +308,7 @@ All writes are **atomic** (written to a temp file then `os.replace()`).
 
 | Table | Logged event | Key columns |
 |---|---|---|
-| `target_selections` | Every target selected | `track_id`, `face_id`, `person_id`, `bbox_area`, `ss`, `ls`, `eligible` |
+| `target_selections` | Biggest-bbox candidate after face_id resolves and cooldown passes (logged before eligibility/ss4 gate) | `track_id`, `face_id`, `person_id`, `bbox_area`, `ss`, `ls`, `eligible` |
 | `ss_changes` | Social state transitions | `person_id`, `old_ss`, `new_ss` |
 | `ls_changes` | Learning state transitions | `person_id`, `old_ls`, `new_ls`, `reward_delta` |
 
@@ -398,7 +428,7 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ SS3: Short Conversation (max 3 turns, max 120s)     │
+│ SS3: Short Conversation (max 3 turns)                │
 │                                                     │
 │  ① Use cached LLM-generated starter question         │
 │     (pre-fetched in background, e.g. "How's your   │
@@ -417,6 +447,8 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 │  0 responses → ABORT: no_response_conversation      │
 └─────────────────────────────────────────────────────┘
 ```
+
+Note: `SS3_MAX_TIME = 120.0s` is defined in code but currently not enforced in the SS3 loop.
 
 ### 4.7 Hunger / QR Feeding Tree
 
@@ -664,12 +696,6 @@ A background `_db_thread` drains the `_db_queue` to avoid blocking the interacti
       Greet + Ask Name + Extract Name + Register
               │   Success
               ▼
-         [ss2: Known, Not Greeted]
-           ↗  ↑ (next day — daily reset of greeted_today)
-              │
-         Say "Hi <name>" + Response received
-              │   Success
-              ▼
          [ss3: Known, Greeted, No Talk]
               │
          Conversation (≥1 user turn)
@@ -678,6 +704,13 @@ A background `_db_thread` drains the `_db_queue` to avoid blocking the interacti
          [ss4: Known, Greeted, Talked]    ← TERMINAL (today)
               │
          (next day reset → back to ss2)
+              │
+              ▼
+         [ss2: Known, Not Greeted]
+              │
+         Say "Hi <name>" + Response received
+              │   Success
+              └────────────────────────────► [ss3]
 ```
 
 ### 6.2 Learning State Machine
@@ -728,7 +761,7 @@ RPC handle thread                → respond() (YARP managed)
 └── [per interaction]:
       ├── _monitor_thread        → target monitor (15Hz)
       ├── LLM future             → single-slot ThreadPoolExecutor
-      └── behaviour threads      → ao_hi, ao_start, ao_stop (fire-and-forget)
+      └── behaviour thread       → ao_hi in SS1 (fire-and-forget)
 ```
 
 **Locks & Events:**
@@ -780,7 +813,7 @@ All files under `modules/alwaysOn/memory/`:
 | `SS2_GREET_TIMEOUT` | 10.0s | Wait for greeting response (SS2) |
 | `SS3_STT_TIMEOUT` | 12.0s | Wait per conversation turn (SS3) |
 | `SS3_MAX_TURNS` | 3 | Maximum conversation turns |
-| `SS3_MAX_TIME` | 120.0s | Max total SS3 conversation time |
+| `SS3_MAX_TIME` | 120.0s | Defined SS3 total-time cap (currently not enforced in loop) |
 | `LLM_TIMEOUT` | 60.0s | Maximum LLM wait |
 | `MONITOR_HZ` | 15.0 | Target monitor polling rate |
 | `TARGET_LOST_TIMEOUT` | 3.0s | Grace period before declaring target lost |
