@@ -186,7 +186,7 @@ Runs at **20 Hz** (period = 0.05 s). Steps each cycle:
 
 ```
 1. Check ports connected (landmarks + img). Wait if not.
-2. Day-change check → prune greeted_today / talked_today if new day
+2. Day-change check → reload memory JSON from disk, then prune greeted_today / talked_today if new day
 3. _read_landmarks()     → parse face bottles from YARP
 4. _read_image()         → get camera frame (with frame skip)
 5. _compute_face_states()→ enrich each face with SS, LS, eligibility, last_greeted_ts
@@ -195,9 +195,11 @@ Runs at **20 Hz** (period = 0.05 s). Steps each cycle:
    IF face_id NOT resolved (still "recognizing"/"unmatched") → WAIT, do not fall back
 
    IF resolved AND not in cooldown:
-     └─ IF eligible AND ss != ss4:
+     └─ IF eligible AND ss != ss4 AND interactionManager status is available+idle:
           → set interaction_busy = True
           → start _run_interaction_thread(candidate)
+        ELSE:
+          → skip proactive spawn this cycle
 
 7. Annotate & publish image
 8. Publish debug bottle
@@ -225,8 +227,14 @@ if not _is_face_id_resolved(biggest['face_id']):
 ### 3.6 Interaction Trigger Flow
 
 ```
+updateModule proactive trigger
+  ├─ Select biggest resolved face (cooldown + eligibility checks)
+  ├─ Pre-spawn check interactionManager status
+  │     └─ If unavailable or busy → skip spawn
+  └─ Spawn _run_interaction_thread(target)
+
 _run_interaction_thread(target)
-  ├─ Check if interactionManager is already busy → skip if yes
+  ├─ Re-check interactionManager status → skip if unavailable/busy
   ├─ Skip if ss4
   ├─ _execute_interaction_interface("ao_start") → signal the robot body
   ├─ _run_interaction_manager(track_id, face_id, ss)
@@ -241,7 +249,7 @@ _run_interaction_thread(target)
   
   [finally]
   └─ interaction_busy = False
-  └─ Update cooldown timestamp
+  └─ Clear selected target/bbox and update cooldown timestamp
 ```
 
 ### 3.7 Reward & Learning State Updates
@@ -742,7 +750,9 @@ RPC handle thread                → respond() (YARP managed)
 
 | Primitive | Purpose |
 |---|---|
-| `state_lock` (faceSelector) | Protect `current_faces`, `interaction_busy`, `last_interaction_time`, etc. |
+| `state_lock` (faceSelector) | Protect shared runtime state snapshots (`current_faces`, target metadata, cooldown map, etc.) |
+| `_interaction_lock` (faceSelector) | Serialize `interaction_busy` transitions and spawn/finalize interaction decisions |
+| `_memory_lock` (faceSelector) | Protect memory dicts (`greeted_today`, `talked_today`, `learning_data`) and JSON I/O snapshots |
 | `_last_greeted_lock` (faceSelector) | Protect `_last_greeted_snapshot` for background refresh |
 | `run_lock` (interactionManager) | Mutual exclusion for interaction execution |
 | `abort_event` (interactionManager) | Signal abort to all interaction sub-steps |
