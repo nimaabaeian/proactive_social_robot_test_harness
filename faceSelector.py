@@ -135,6 +135,11 @@ class FaceSelectorModule(yarp.RFModule):
         self.interaction_busy = False
         self.interaction_thread: Optional[threading.Thread] = None
 
+        # Lock guarding in-memory memory dicts and their file I/O
+        self._memory_lock = threading.Lock()
+        # Lock guarding interaction_busy transitions and spawn decisions
+        self._interaction_lock = threading.Lock()
+
         # Cooldown
         self.last_interaction_time: Dict[str, float] = {}
         self.interaction_cooldown = 5.0
@@ -276,13 +281,21 @@ class FaceSelectorModule(yarp.RFModule):
         self._log("INFO", "Closing...")
         if self.interaction_thread and self.interaction_thread.is_alive():
             self.interaction_thread.join(timeout=5.0)
-        self._save_all_json_files()
+        # Enqueue final saves (async via IO worker)
+        self._enqueue_save("greeted")
+        self._enqueue_save("talked")
+        self._enqueue_save("learning")
+        # Signal IO worker to stop, then drain/join
         self._io_queue.put(None)
-        self._db_queue.put(None)
         if self._io_thread:
-            self._io_thread.join(timeout=3.0)
+            self._io_thread.join(timeout=5.0)
+            if self._io_thread.is_alive():
+                self._log("WARNING", "IO worker did not finish in time – proceeding with shutdown")
+        self._db_queue.put(None)
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
+            if self._db_thread.is_alive():
+                self._log("WARNING", "DB worker did not finish in time – proceeding with shutdown")
         for port in [self.landmarks_port, self.img_in_port, self.img_out_port,
                      self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc]:
             if port:
@@ -317,9 +330,7 @@ class FaceSelectorModule(yarp.RFModule):
             today = self._get_today_date()
             if self._current_day != today:
                 self._log("INFO", f"Day change: {self._current_day} → {today}")
-                with self.state_lock:
-                    self.greeted_today = self._prune_to_today(self.greeted_today)
-                    self.talked_today  = self._prune_to_today(self.talked_today)
+                self._reload_memory_from_disk_and_prune_today()
                 self._enqueue_save("greeted")
                 self._enqueue_save("talked")
                 self._current_day = today
@@ -342,67 +353,80 @@ class FaceSelectorModule(yarp.RFModule):
             #    Policy: ALWAYS pick biggest bbox. If unresolved, wait (don't switch
             #    to smaller resolved faces). Only interact once the biggest resolves.
             current_time = time.time()
-            with self.state_lock:
-                if not self.interaction_busy:
-                    candidate = self._select_biggest_face(self.current_faces)
-                    if candidate:
-                        face_id = candidate.get("face_id", "unknown")
-                        track_id = candidate.get("track_id", -1)
-                        person_id = candidate.get("person_id", face_id)
-                        bbox = candidate.get("bbox", (0, 0, 0, 0))
-                        area = bbox[2] * bbox[3]
-                        resolved = self._is_face_id_resolved(face_id)
+            with self._interaction_lock:
+                with self.state_lock:
+                    if not self.interaction_busy:
+                        candidate = self._select_biggest_face(self.current_faces)
+                        if candidate:
+                            face_id = candidate.get("face_id", "unknown")
+                            track_id = candidate.get("track_id", -1)
+                            person_id = candidate.get("person_id", face_id)
+                            bbox = candidate.get("bbox", (0, 0, 0, 0))
+                            area = bbox[2] * bbox[3]
+                            resolved = self._is_face_id_resolved(face_id)
 
-                        # If face_id not yet resolved → skip this cycle (don't fall back)
-                        if not resolved:
-                            if self.verbose_debug:
-                                self._log("DEBUG",
-                                    f"Biggest face track={track_id} still resolving "
-                                    f"(face_id='{face_id}', area={area:.0f}), waiting...")
-                        else:
-                            # Face is resolved — proceed with interaction checks
-                            cd_key = str(person_id) if self._is_face_known(str(person_id)) else f"unknown:{track_id}"
-                            last_int = self.last_interaction_time.get(cd_key, 0)
-
-                            if current_time - last_int < self.interaction_cooldown:
+                            # If face_id not yet resolved → skip this cycle (don't fall back)
+                            if not resolved:
                                 if self.verbose_debug:
-                                    self._log("DEBUG", f"{person_id} in cooldown")
+                                    self._log("DEBUG",
+                                        f"Biggest face track={track_id} still resolving "
+                                        f"(face_id='{face_id}', area={area:.0f}), waiting...")
                             else:
-                                ss = candidate.get("social_state", "ss1")
-                                ls = candidate.get("learning_state", self.LS1)
-                                eligible = candidate.get("eligible", False)
-                                lg_ts = candidate.get("last_greeted_ts")
+                                # Face is resolved — proceed with interaction checks
+                                cd_key = str(person_id) if self._is_face_known(str(person_id)) else f"unknown:{track_id}"
+                                last_int = self.last_interaction_time.get(cd_key, 0)
 
-                                # Log selection to DB
-                                self._db_log("target_selection", {
-                                    "track_id": track_id,
-                                    "face_id": face_id,
-                                    "person_id": person_id,
-                                    "bbox_area": area,
-                                    "ss": ss, "ls": ls, "eligible": eligible,
-                                    "last_greeted_ts": lg_ts,
-                                })
+                                if current_time - last_int < self.interaction_cooldown:
+                                    if self.verbose_debug:
+                                        self._log("DEBUG", f"{person_id} in cooldown")
+                                else:
+                                    ss = candidate.get("social_state", "ss1")
+                                    ls = candidate.get("learning_state", self.LS1)
+                                    eligible = candidate.get("eligible", False)
+                                    lg_ts = candidate.get("last_greeted_ts")
 
-                                if eligible:
-                                    if ss == "ss4":
-                                        if self.verbose_debug:
-                                            self._log("DEBUG", f"{person_id} is ss4 – skipping")
-                                    else:
-                                        self.selected_target = candidate
-                                        self.selected_bbox_last = candidate["bbox"]
-                                        self.interaction_busy = True
-                                        self.last_interaction_time[cd_key] = current_time
+                                    # Log selection to DB
+                                    self._db_log("target_selection", {
+                                        "track_id": track_id,
+                                        "face_id": face_id,
+                                        "person_id": person_id,
+                                        "bbox_area": area,
+                                        "ss": ss, "ls": ls, "eligible": eligible,
+                                        "last_greeted_ts": lg_ts,
+                                    })
 
-                                        self._log("INFO",
-                                            f">>> TARGET: {person_id} "
-                                            f"(track={track_id}, {ss}, LS{ls}, area={area:.0f})")
+                                    if eligible:
+                                        if ss == "ss4":
+                                            if self.verbose_debug:
+                                                self._log("DEBUG", f"{person_id} is ss4 – skipping")
+                                        else:
+                                            # Pre-spawn busy check (cooldown applied regardless)
+                                            self.last_interaction_time[cd_key] = current_time
 
-                                        self.interaction_thread = threading.Thread(
-                                            target=self._run_interaction_thread,
-                                            args=(candidate,), daemon=True)
-                                        self.interaction_thread.start()
-                                elif self.verbose_debug:
-                                    self._log("DEBUG", f"{person_id} not eligible (LS{ls})")
+                                            im_status = self._interaction_manager_status()
+                                            if isinstance(im_status, dict) and not im_status.get("busy", False):
+                                                # Status confirmed not busy — spawn
+                                                self.selected_target = candidate
+                                                self.selected_bbox_last = candidate["bbox"]
+                                                self.interaction_busy = True
+
+                                                self._log("INFO",
+                                                    f">>> TARGET: {person_id} "
+                                                    f"(track={track_id}, {ss}, LS{ls}, area={area:.0f})")
+
+                                                self.interaction_thread = threading.Thread(
+                                                    target=self._run_interaction_thread,
+                                                    args=(candidate,), daemon=True)
+                                                self.interaction_thread.start()
+                                            else:
+                                                # Status is None (RPC error/not connected) or busy — skip spawn
+                                                if im_status is None:
+                                                    self._log("WARNING", "InteractionManager status unavailable – skipping")
+                                                else:
+                                                    self._log("INFO", "InteractionManager busy (pre-spawn) – skipping")
+                                                # interaction_busy stays False; cooldown already applied
+                                    elif self.verbose_debug:
+                                        self._log("DEBUG", f"{person_id} not eligible (LS{ls})")
 
             # 5. Annotate & publish image
             if frame is not None:
@@ -744,8 +768,8 @@ class FaceSelectorModule(yarp.RFModule):
             ss       = target.get("social_state", "ss1")
 
             status = self._interaction_manager_status()
-            if status is not None and bool(status.get("busy", False)):
-                self._log("INFO", "InteractionManager busy – skipping proactive")
+            if not isinstance(status, dict) or status.get("busy", False):
+                self._log("INFO", "InteractionManager unavailable or busy – skipping proactive")
                 return
 
             if ss == "ss4":
@@ -771,16 +795,17 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("ERROR", f"Interaction thread error: {e}")
             import traceback; traceback.print_exc()
         finally:
-            with self.state_lock:
-                self.interaction_busy = False
-                self.selected_target = None
-                self.selected_bbox_last = None
-                final_id = str(self.track_to_person.get(
-                    target.get("track_id", -1),
-                    target.get("face_id", "unknown")))
-                cd_key = final_id if self._is_face_known(final_id) else f"unknown:{target.get('track_id', -1)}"
-                if did_run_interaction:
-                    self.last_interaction_time[cd_key] = time.time()
+            with self._interaction_lock:
+                with self.state_lock:
+                    self.interaction_busy = False
+                    self.selected_target = None
+                    self.selected_bbox_last = None
+                    final_id = str(self.track_to_person.get(
+                        target.get("track_id", -1),
+                        target.get("face_id", "unknown")))
+                    cd_key = final_id if self._is_face_known(final_id) else f"unknown:{target.get('track_id', -1)}"
+                    if did_run_interaction:
+                        self.last_interaction_time[cd_key] = time.time()
             self._log("INFO", "--- INTERACTION COMPLETE ---")
 
     def _execute_interaction_interface(self, command: str) -> bool:
@@ -874,13 +899,14 @@ class FaceSelectorModule(yarp.RFModule):
 
             now_iso = datetime.now(self.TIMEZONE).isoformat()
 
-            with self.state_lock:
-                self.track_to_person[track_id] = person_id
-                is_known_id = self._is_face_known(person_id)
-                if greeted and is_known_id:
-                    self.greeted_today[person_id] = now_iso
-                if talked and is_known_id:
-                    self.talked_today[person_id] = now_iso
+            with self._memory_lock:
+                with self.state_lock:
+                    self.track_to_person[track_id] = person_id
+                    is_known_id = self._is_face_known(person_id)
+                    if greeted and is_known_id:
+                        self.greeted_today[person_id] = now_iso
+                    if talked and is_known_id:
+                        self.talked_today[person_id] = now_iso
 
             if greeted:
                 self._enqueue_save("greeted")
@@ -938,7 +964,7 @@ class FaceSelectorModule(yarp.RFModule):
         if delta == 0:
             return
 
-        with self.state_lock:
+        with self._memory_lock:
             current_ls = self.learning_data.get(person_id, {}).get("ls", self.LS1)
 
         old_ls = current_ls
@@ -950,7 +976,7 @@ class FaceSelectorModule(yarp.RFModule):
             new_ls = current_ls
 
         now_iso = datetime.now(self.TIMEZONE).isoformat()
-        with self.state_lock:
+        with self._memory_lock:
             self.learning_data[person_id] = {"ls": new_ls, "updated_at": now_iso}
 
         self._enqueue_save("learning")
@@ -1035,20 +1061,42 @@ class FaceSelectorModule(yarp.RFModule):
     # ==================== JSON File Management ====================
 
     def _load_all_json_files(self):
-        self.greeted_today = self._load_json(self.greeted_path, {})
-        self.talked_today  = self._load_json(self.talked_path,  {})
-        learning_raw       = self._load_json(self.learning_path, {"people": {}})
-        self.learning_data = learning_raw.get("people", {})
+        with self._memory_lock:
+            self.greeted_today = self._load_json(self.greeted_path, {})
+            self.talked_today  = self._load_json(self.talked_path,  {})
+            learning_raw       = self._load_json(self.learning_path, {"people": {}})
+            self.learning_data = learning_raw.get("people", {})
 
-        # Clamp LS values to [1, 3]
-        for pdata in self.learning_data.values():
-            if "ls" in pdata:
-                pdata["ls"] = max(1, min(3, pdata["ls"]))
+            # Clamp LS values to [1, 3]
+            for pdata in self.learning_data.values():
+                if "ls" in pdata:
+                    pdata["ls"] = max(1, min(3, pdata["ls"]))
 
-        self.greeted_today = self._prune_to_today(self.greeted_today)
-        self.talked_today  = self._prune_to_today(self.talked_today)
+            self.greeted_today = self._prune_to_today(self.greeted_today)
+            self.talked_today  = self._prune_to_today(self.talked_today)
         self._log("INFO",
             f"Loaded – greeted:{len(self.greeted_today)} "
+            f"talked:{len(self.talked_today)} "
+            f"learning:{len(self.learning_data)}")
+
+    def _reload_memory_from_disk_and_prune_today(self):
+        """Re-read memory JSON files from disk and prune greeted/talked to today.
+        Called on day-change to pick up any writes that happened outside this process.
+        """
+        with self._memory_lock:
+            self.greeted_today = self._load_json(self.greeted_path, {})
+            self.talked_today  = self._load_json(self.talked_path,  {})
+            learning_raw       = self._load_json(self.learning_path, {"people": {}})
+            self.learning_data = learning_raw.get("people", {})
+
+            for pdata in self.learning_data.values():
+                if "ls" in pdata:
+                    pdata["ls"] = max(1, min(3, pdata["ls"]))
+
+            self.greeted_today = self._prune_to_today(self.greeted_today)
+            self.talked_today  = self._prune_to_today(self.talked_today)
+        self._log("INFO",
+            f"Day-change reload – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
             f"learning:{len(self.learning_data)}")
 
@@ -1082,17 +1130,17 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("ERROR", f"Failed to save {path}: {e}")
 
     def _save_greeted_json(self):
-        with self.state_lock:
+        with self._memory_lock:
             data = dict(self.greeted_today)
         self._save_json_atomic(self.greeted_path, data)
 
     def _save_talked_json(self):
-        with self.state_lock:
+        with self._memory_lock:
             data = dict(self.talked_today)
         self._save_json_atomic(self.talked_path, data)
 
     def _save_learning_json(self):
-        with self.state_lock:
+        with self._memory_lock:
             data = {"people": dict(self.learning_data)}
         self._save_json_atomic(self.learning_path, data)
 
