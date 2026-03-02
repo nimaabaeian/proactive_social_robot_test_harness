@@ -78,8 +78,8 @@ class FaceSelectorModule(yarp.RFModule):
     LS_NAMES = {1: "LS1", 2: "LS2", 3: "LS3"}
 
     LS_VALID_DISTANCES = {
-        1: {"SO_CLOSE", "CLOSE"},
-        2: {"SO_CLOSE", "CLOSE", "FAR"}
+        1: {"SO_CLOSE", "CLOSE", "FAR"},
+        2: {"SO_CLOSE", "CLOSE", "FAR", "VERY_FAR"},
     }
     LS_VALID_ATTENTIONS = {
         1: {"MUTUAL_GAZE"},
@@ -261,6 +261,7 @@ class FaceSelectorModule(yarp.RFModule):
                 setattr(self, name, t)
 
             self._log("INFO", f"FaceSelectorModule ready @ {1.0/self.period:.0f} Hz")
+            threading.Thread(target=self._prewarm_rpc_connections, daemon=True).start()
             return True
 
         except Exception as e:
@@ -808,6 +809,37 @@ class FaceSelectorModule(yarp.RFModule):
                         self.last_interaction_time[cd_key] = time.time()
             self._log("INFO", "--- INTERACTION COMPLETE ---")
 
+    def _prewarm_rpc_connections(self):
+        """Send a no-op ping to both RPC servers so TCP setup happens at startup
+        rather than on the first real interaction command."""
+        time.sleep(1.0)  # brief wait for servers to register
+        for attempt in range(5):
+            try:
+                if (self.interaction_manager_rpc and
+                        self.interaction_manager_rpc.getOutputCount() > 0):
+                    cmd = yarp.Bottle()
+                    cmd.addString("status")
+                    reply = yarp.Bottle()
+                    self.interaction_manager_rpc.write(cmd, reply)
+                    self._log("INFO", "InteractionManager RPC pre-warmed")
+                    break
+            except Exception as e:
+                self._log("DEBUG", f"IM RPC pre-warm attempt {attempt + 1} failed: {e}")
+                time.sleep(2.0)
+
+        for attempt in range(5):
+            try:
+                if (self.interaction_interface_rpc and
+                        self.interaction_interface_rpc.getOutputCount() > 0):
+                    # interactionInterface doesn't have a status command — just open
+                    # the connection by calling getOutputCount(); TCP is established
+                    # when addOutput() was called, so the loop above already covers it.
+                    self._log("INFO", "InteractionInterface RPC pre-warmed")
+                    break
+            except Exception as e:
+                self._log("DEBUG", f"IF RPC pre-warm attempt {attempt + 1} failed: {e}")
+                time.sleep(2.0)
+
     def _execute_interaction_interface(self, command: str) -> bool:
         try:
             if self.interaction_interface_rpc.getOutputCount() == 0:
@@ -816,7 +848,8 @@ class FaceSelectorModule(yarp.RFModule):
             cmd = yarp.Bottle()
             cmd.addString("exe")
             cmd.addString(command)
-            self.interaction_interface_rpc.write(cmd)
+            reply = yarp.Bottle()
+            self.interaction_interface_rpc.write(cmd, reply)
             return True
         except Exception as e:
             self._log("ERROR", f"interactionInterface exception: {e}")
