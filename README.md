@@ -290,6 +290,7 @@ Uses a **sliding window** per person:
 | `_io_thread` | `_io_worker()` | Drains `_io_queue` → saves JSON files asynchronously |
 | `_db_thread` | `_db_worker()` | Drains `_db_queue` → writes SQLite records |
 | `_lg_refresh_thread` | `_last_greeted_refresh_loop()` | Re-reads `last_greeted.json` every 0.2s (5 Hz) |
+| `_prewarm_thread` | `_prewarm_rpc_connections()` | Pre-warms RPC connections at startup (one-time, daemon) |
 | `interaction_thread` | `_run_interaction_thread()` | Spawned per interaction, runs the RPC call |
 
 ### 3.9 Persistent Data Files
@@ -544,6 +545,7 @@ Futures are polled with `_await_future_abortable()` which checks `abort_event` e
 2. Starts/verifies the Ollama server
 3. Pulls `llama3.2:3b` if not present
 4. Pre-fetches a conversation starter in the background
+5. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
 
 ### 4.11 Speech Output (TTS)
 
@@ -741,6 +743,7 @@ RPC handle thread                → respond() (YARP managed)
 ├── _db_thread                   → async SQLite writes
 ├── _qr_reader_thread            → camera QR scanning (50fps)
 ├── _responsive_thread           → watches STT for user-initiated greetings
+├── _prewarm_thread              → pre-warm RPC connections at startup (one-time)
 └── [per interaction]:
       ├── _monitor_thread        → target monitor (15Hz)
       ├── LLM future             → single-slot ThreadPoolExecutor
