@@ -78,12 +78,17 @@ class FaceSelectorModule(yarp.RFModule):
     LS_NAMES = {1: "LS1", 2: "LS2", 3: "LS3"}
 
     LS_VALID_DISTANCES = {
-        1: {"SO_CLOSE", "CLOSE", "FAR"},
-        2: {"SO_CLOSE", "CLOSE", "FAR", "VERY_FAR"},
+        1: {"SO_CLOSE", "CLOSE"},
+        2: {"SO_CLOSE", "CLOSE", "FAR"},
     }
     LS_VALID_ATTENTIONS = {
         1: {"MUTUAL_GAZE"},
         2: {"MUTUAL_GAZE", "NEAR_GAZE"}
+    }
+
+    LS_MIN_TIME_IN_VIEW = {
+        1: 3.0,
+        2: 1.0,
     }
 
     # Colors for drawing (BGR format)
@@ -766,10 +771,14 @@ class FaceSelectorModule(yarp.RFModule):
 
         distance = face.get("distance", "UNKNOWN")
         attention = face.get("attention", "AWAY")
+        time_in_view = face.get("time_in_view", 0.0)
 
         if distance not in self.LS_VALID_DISTANCES.get(ls, set()):
             return False
         if attention not in self.LS_VALID_ATTENTIONS.get(ls, set()):
+            return False
+        min_tiv = self.LS_MIN_TIME_IN_VIEW.get(ls, 0.0)
+        if time_in_view < min_tiv:
             return False
         return True
 
