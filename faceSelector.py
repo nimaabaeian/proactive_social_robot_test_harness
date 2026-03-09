@@ -121,6 +121,7 @@ class FaceSelectorModule(yarp.RFModule):
         self.debug_port: Optional[yarp.Port] = None
         self.interaction_manager_rpc: Optional[yarp.RpcClient] = None
         self.interaction_interface_rpc: Optional[yarp.RpcClient] = None
+        self.stm_context_port: Optional[yarp.BufferedPortBottle] = None  # /alwayson/stm/context:o
 
         # Image handling
         self.img_width = 640
@@ -140,9 +141,15 @@ class FaceSelectorModule(yarp.RFModule):
         # Lock guarding interaction_busy transitions and spawn decisions
         self._interaction_lock = threading.Lock()
 
-        # Cooldown
+        # Cooldown — base value and context-driven overrides
         self.last_interaction_time: Dict[str, float] = {}
-        self.interaction_cooldown = 5.0
+        self.interaction_cooldown = 5.0   # fallback (kept for back-compat)
+        self.cooldown_lively: float = 3.0   # label == 1 : active/lively scene → shorter
+        self.cooldown_calm:   float = 15.0  # label == 0 : calm/quiet scene  → longer
+        self.cooldown_default: float = 5.0  # label == -1 or unknown
+
+        # STM context (cluster label from /alwayson/stm/context:o)
+        self.current_context_label: int = -1  # -1 = not yet received
 
         # Image frame skip
         self.frame_skip_counter = 0
@@ -224,6 +231,18 @@ class FaceSelectorModule(yarp.RFModule):
                 self._log("ERROR", f"Failed to open debug port")
                 return False
 
+            self.stm_context_port = yarp.BufferedPortBottle()
+            if not self.stm_context_port.open(f"/{self.module_name}/context:i"):
+                self._log("ERROR", "Failed to open STM context port")
+                return False
+            # Non-critical: try to auto-connect; continue even if STM is not yet running
+            _ctx_remote = "/alwayson/stm/context:o"
+            _ctx_local  = f"/{self.module_name}/context:i"
+            if yarp.Network.connect(_ctx_remote, _ctx_local):
+                self._log("INFO", f"STM context port connected: {_ctx_remote} → {_ctx_local}")
+            else:
+                self._log("WARNING", f"STM context port not yet available – will work without context (cooldown={self.cooldown_default}s)")
+
             self.interaction_manager_rpc = yarp.RpcClient()
             if not self.interaction_manager_rpc.open(f"/{self.module_name}/interactionManager:rpc"):
                 self._log("ERROR", "Failed to open interactionManager RPC port")
@@ -273,7 +292,8 @@ class FaceSelectorModule(yarp.RFModule):
         self._log("INFO", "Interrupting...")
         self._running = False
         for port in [self.landmarks_port, self.img_in_port, self.img_out_port,
-                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc]:
+                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc,
+                     self.stm_context_port]:
             if port:
                 port.interrupt()
         return True
@@ -298,7 +318,8 @@ class FaceSelectorModule(yarp.RFModule):
             if self._db_thread.is_alive():
                 self._log("WARNING", "DB worker did not finish in time – proceeding with shutdown")
         for port in [self.landmarks_port, self.img_in_port, self.img_out_port,
-                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc]:
+                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc,
+                     self.stm_context_port]:
             if port:
                 port.close()
         return True
@@ -335,6 +356,13 @@ class FaceSelectorModule(yarp.RFModule):
                 self._enqueue_save("greeted")
                 self._enqueue_save("talked")
                 self._current_day = today
+
+            # 0. Read STM context (non-blocking – best-effort)
+            if self.stm_context_port is not None:
+                ctx_btl = self.stm_context_port.read(False)
+                if ctx_btl is not None:
+                    self.current_context_label = ctx_btl.get(2).asInt8()
+                    self._log("DEBUG", f"STM context updated → label={self.current_context_label}")
 
             # 1. Read landmarks
             faces = self._read_landmarks()
@@ -377,9 +405,9 @@ class FaceSelectorModule(yarp.RFModule):
                                 cd_key = str(person_id) if self._is_face_known(str(person_id)) else f"unknown:{track_id}"
                                 last_int = self.last_interaction_time.get(cd_key, 0)
 
-                                if current_time - last_int < self.interaction_cooldown:
+                                if current_time - last_int < self._effective_cooldown():
                                     if self.verbose_debug:
-                                        self._log("DEBUG", f"{person_id} in cooldown")
+                                        self._log("DEBUG", f"{person_id} in cooldown (label={self.current_context_label}, cd={self._effective_cooldown():.1f}s)")
                                 else:
                                     ss = candidate.get("social_state", "ss1")
                                     ls = candidate.get("learning_state", self.LS1)
@@ -452,6 +480,21 @@ class FaceSelectorModule(yarp.RFModule):
                 self._log("CRITICAL", "Too many consecutive errors, stopping")
                 return False
             return True
+
+    # ==================== Context-Aware Cooldown ====================
+
+    def _effective_cooldown(self) -> float:
+        """Return the interaction cooldown based on the latest STM context label.
+
+        label == 1  → lively/active scene  → shorter cooldown (more interactions)
+        label == 0  → calm/quiet scene     → longer  cooldown (fewer interactions)
+        label == -1 → not yet received or noise cluster → default cooldown
+        """
+        if self.current_context_label == 1:
+            return self.cooldown_lively
+        elif self.current_context_label == 0:
+            return self.cooldown_calm
+        return self.cooldown_default
 
     # ==================== Landmark Parsing ====================
 
