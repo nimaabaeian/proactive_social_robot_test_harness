@@ -35,6 +35,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -397,6 +398,7 @@ class InteractionManagerModule(yarp.RFModule):
                     "success": True,
                     "commands": [
                         "run <track_id> <face_id> <ss1|ss2|ss3|ss4>",
+                        "hunger <hs1|hs2|hs3>  – set hunger level (hs1=100%, hs2=59%, hs3=24%)",
                         "status", "help", "quit",
                     ],
                 })
@@ -405,6 +407,21 @@ class InteractionManagerModule(yarp.RFModule):
                 self._running = False
                 self.stopModule()
                 return self._reply_ok(reply, {"success": True, "message": "Shutting down"})
+
+            if command == "hunger":
+                if cmd.size() < 2:
+                    return self._reply_error(reply, "Usage: hunger <hs1|hs2|hs3>")
+                level_arg = cmd.get(1).asString().lower()
+                level_map = {"hs1": 100.0, "hs2": 59.0, "hs3": 24.0}
+                if level_arg not in level_map:
+                    return self._reply_error(reply, "Invalid hunger state. Use: hs1 (100%), hs2 (59%), hs3 (24%)")
+                new_level = level_map[level_arg]
+                with self.hunger._lock:
+                    self.hunger.level = new_level
+                    self.hunger.last_update_ts = time.time()
+                hs = self.hunger.get_state()
+                self._log("INFO", f"Hunger manually set to {new_level}% ({hs})")
+                return self._reply_ok(reply, {"success": True, "hunger_level": new_level, "hunger_state": hs})
 
             if command != "run":
                 return self._reply_error(reply, f"Unknown command: {command}")
@@ -788,7 +805,7 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("WARNING", f"Telegram DB read failed: {e}")
             return None
 
-        face_lower = face_name.strip().lower()
+        face_norm = self._normalize_name(face_name)
         best_record: Optional[Dict[str, Any]] = None
 
         for _chat_id, data_json in rows:
@@ -799,20 +816,20 @@ class InteractionManagerModule(yarp.RFModule):
             if not isinstance(record, dict):
                 continue
 
-            db_name = (record.get("name") or "").strip().lower()
-            db_nick = (record.get("nickname") or "").strip().lower()
+            db_name = self._normalize_name(record.get("name") or "")
+            db_nick = self._normalize_name(record.get("nickname") or "")
 
-            if db_name and db_name == face_lower:
+            if db_name and db_name == face_norm:
                 best_record = record
                 break  # exact name match — done
-            if db_nick and db_nick == face_lower:
+            if db_nick and db_nick == face_norm:
                 best_record = record
                 break  # exact nickname match — done
             # Partial: face_name is a first-name substring of the DB name
-            if db_name and face_lower in db_name.split():
+            if db_name and face_norm in db_name.split():
                 best_record = record
                 # keep looking for an exact match
-            elif db_nick and face_lower in db_nick.split():
+            elif db_nick and face_norm in db_nick.split():
                 if best_record is None:
                     best_record = record
 
@@ -919,17 +936,15 @@ class InteractionManagerModule(yarp.RFModule):
             self._log("WARNING", f"SS3: telegram lookup failed (continuing without): {e}")
 
         # --- Opening line ---
-        # If we have user context, generate a personalised starter right now
-        # (the pre-cached generic starter won't use their data).
+        # If we have user context, generate a personalised starter via the pool
+        # so it is abort-aware and doesn't block the main thread.
+        # The pre-cached generic starter is used as the fallback.
+        fallback_starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
         if user_context:
-            try:
-                starter = self._llm_generate_convo_starter(user_context=user_context)
-            except Exception:
-                starter = None
-            if not starter:
-                starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
+            future = self._llm_pool.submit(self._llm_generate_convo_starter, user_context)
+            starter = self._await_future_abortable(future, fallback_starter, self.LLM_TIMEOUT) or fallback_starter
         else:
-            starter = self._cached_starter or self._im_prompts.get("convo_starter_fallback", "How are you doing these days?")
+            starter = fallback_starter
 
         self._cached_starter = None
         threading.Thread(target=self._generate_starter_background, daemon=True).start()
@@ -1221,6 +1236,18 @@ class InteractionManagerModule(yarp.RFModule):
                 time.sleep(0.05)
 
         self._log("INFO", "Responsive loop stopped")
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        """Lowercase + strip + remove accents for robust name matching.
+        'André' == 'andre', 'Marco' == 'marco', 'Ñoño' == 'nono'.
+        """
+        s = (name or "").strip().lower()
+        # Decompose to NFD then drop combining diacritics (category Mn)
+        return "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"
+        )
 
     @staticmethod
     def _normalize_text_for_match(text: str) -> str:
