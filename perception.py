@@ -294,6 +294,28 @@ class VisionAnalyzer(yarp.RFModule):
                 
                 self._publish_landmarks(matched_face, face_forward, pitch, yaw, roll, cos_angle, attention, is_talking, time_in_view)
         
+        # Publish data for faces detected by object recognition but not matched by MediaPipe
+        # (e.g., faces too small for landmark detection)
+        for face_data in self.detected_faces:
+            if face_data['track_id'] not in matched_track_ids:
+                track_id = face_data['track_id']
+                if track_id not in self.first_seen_track:
+                    self.first_seen_track[track_id] = current_time
+                self.last_seen_track[track_id] = current_time
+                time_in_view = current_time - self.first_seen_track[track_id]
+
+                self._publish_landmarks(
+                    face_data=face_data,
+                    gaze_direction=np.array([0.0, 0.0, 0.0]),
+                    pitch=0.0,
+                    yaw=0.0,
+                    roll=0.0,
+                    cos_angle=0.0,
+                    attention="UNKNOWN",
+                    is_talking=0,
+                    time_in_view=time_in_view
+                )
+
         tracks_to_remove = [tid for tid, last_time in self.last_seen_track.items() if current_time - last_time > 1.0]
         for tid in tracks_to_remove:
             if tid in self.mouth_motion_history:
@@ -377,11 +399,11 @@ class VisionAnalyzer(yarp.RFModule):
             
             h_norm = h / self.default_height
             
-            if h_norm > 0.5:
+            if h_norm > 0.4:
                 distance = "SO_CLOSE"
-            elif h_norm > 0.3:
+            elif h_norm > 0.2:
                 distance = "CLOSE"
-            elif h_norm > 0.15:
+            elif h_norm > 0.1:
                 distance = "FAR"
             else:
                 distance = "VERY_FAR"
