@@ -1,5 +1,7 @@
-# Always On Cognitive Architecture — `Embodied Behaviour` 
+# Embodied Behaviour
+
 > **Robot:** iCub · **Platform:** YARP · **Author:** Nima Abaeian
+
 ---
 
 ## Table of Contents
@@ -279,7 +281,7 @@ Changes are logged to `data_collection/face_selector.db` and atomically persiste
 ### 5.1 SS1 — Unknown Person
 
 ```
-① Run behaviour: ao_hi
+① Say greeting via TTS (`ss1_greeting` prompt key, default: "Hi there!")
 ② Wait for any response (10 s)  →  no response: abort
 ③ Say "We haven't met — what's your name?"
 ④ Wait for name response (10 s)  →  no response: abort
@@ -630,8 +632,7 @@ RPC handle thread                    →  respond() (YARP-managed)
 ├── _prewarm_thread             →  pre-warms RPC connections (one-shot)
 └── [per interaction]:
       ├── _monitor_thread       →  target monitor @ 15 Hz
-      ├── LLM future            →  single-slot ThreadPoolExecutor
-      └── behaviour thread      →  ao_hi in SS1 (fire-and-forget)
+      └── LLM future            →  single-slot ThreadPoolExecutor
 ```
 
 **Primitives:** `run_lock` · `abort_event` · `_responsive_active` · `_feed_condition` · `_faces_lock`

@@ -666,7 +666,7 @@ class InteractionManagerModule(yarp.RFModule):
 
     def _run_ss1_tree(self, track_id: int, face_id: str, result: Dict):
         """
-        1) Execute ao_hi
+        1) Greet via TTS
         2) Wait response  → if none → abort
         3) Ask name       → if none → abort
         4) Extract name   → retry once → if fail → abort
@@ -674,9 +674,9 @@ class InteractionManagerModule(yarp.RFModule):
         """
         self._log("INFO", "SS1: start")
 
-        # 1) ao_hi
+        # 1) Greet via TTS
         self._clear_stt_buffer()
-        threading.Thread(target=self._execute_behaviour, args=("ao_hi",), daemon=True).start()
+        self._speak_and_wait(self._im_prompts.get("ss1_greeting", "Hi there!"))
         result["greeted"] = True
 
         # 2) Wait for response
