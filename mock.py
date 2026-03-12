@@ -5,18 +5,26 @@ Mimics two output ports that other modules subscribe to:
   1. /alwayson/stm/context:o   (yarp.Port / Bottle)
        Bottle: Int32 episode_id | Int32 chunk | Int8 label
        → mirrors ShortTermMemoryV2.publish_episode_context()
+       Publishes every 5 s; label drifts slowly (low-flip random walk).
 
   2. /interactionManager/hunger:o  (BufferedPortBottle)
        Bottle: String hs  (one of "HS1" | "HS2" | "HS3")
        → mirrors InteractionManagerModule.updateModule() hunger publish
+       Publishes every 5 min; transitions follow the allowed graph:
+           HS1 → HS2
+           HS2 → HS1
+           HS2 → HS3
+           HS3 → HS2
+
 
 Usage:
     python mock.py
-    python mock.py --context-period 2.0 --hs-period 1.0
+    python mock.py --context-period 5.0 --hs-period 300.0
     python mock.py --episode-id 42 --chunk 3 --label 1 --hs HS2
 """
 
 import argparse
+import random
 import sys
 import time
 
@@ -34,20 +42,27 @@ class MockPublisher(yarp.RFModule):
     CONTEXT_PORT_NAME = "/alwayson/stm/context:o"
     HUNGER_PORT_NAME  = "/interactionManager/hunger:o"
 
-    # Cycling HS states (same sequence the real HungerModel produces)
-    HS_STATES = ["HS1", "HS2", "HS3"]
+    # Allowed hunger-state transitions (directed graph)
+    HS_TRANSITIONS: dict[str, list[str]] = {
+        "HS1": ["HS2"],
+        "HS2": ["HS1", "HS3"],
+        "HS3": ["HS2"],
+    }
+
+    # Probability that the context label flips each publish cycle
+    LABEL_FLIP_PROB: float = 0.15
 
     def __init__(self) -> None:
         yarp.RFModule.__init__(self)
 
         # --- configurable via RF params / CLI ---
-        self.context_period: float = 2.0   # seconds between context publishes
-        self.hs_period: float      = 1.0   # seconds between HS publishes
+        self.context_period: float = 5.0    # seconds between context publishes
+        self.hs_period: float      = 300.0  # seconds between HS publishes (5 min)
         self.episode_id: int       = 0
         self.chunk: int            = -1
         self.label: int            = 0
-        self.hs_index: int         = 0     # cycles through HS_STATES
-        self.fixed_hs: str         = ""    # if set, always publish this HS
+        self.current_hs: str       = "HS1"  # current hunger state
+        self.fixed_hs: str         = ""     # if set, always publish this HS
 
         # --- YARP ports ---
         self.context_port: yarp.Port               = yarp.Port()
@@ -76,17 +91,21 @@ class MockPublisher(yarp.RFModule):
             self.label = rf.find("label").asInt32()
         if rf.check("hs"):
             self.fixed_hs = rf.find("hs").asString()
-            if self.fixed_hs not in self.HS_STATES:
-                print(f"[MockPublisher] WARNING: unknown HS value '{self.fixed_hs}', cycling instead")
+            if self.fixed_hs not in self.HS_TRANSITIONS:
+                print(f"[MockPublisher] WARNING: unknown HS value '{self.fixed_hs}', using graph transitions instead")
                 self.fixed_hs = ""
+            else:
+                self.current_hs = self.fixed_hs
 
-        # Open context port
+        # Open context port (unregister first to clear any stale entry)
+        yarp.Network.unregisterName(self.CONTEXT_PORT_NAME)
         if not self.context_port.open(self.CONTEXT_PORT_NAME):
             print(f"[MockPublisher] ERROR: failed to open {self.CONTEXT_PORT_NAME}")
             return False
         print(f"[MockPublisher] Port open: {self.CONTEXT_PORT_NAME}")
 
-        # Open hunger port
+        # Open hunger port (unregister first to clear any stale entry)
+        yarp.Network.unregisterName(self.HUNGER_PORT_NAME)
         if not self.hunger_port.open(self.HUNGER_PORT_NAME):
             print(f"[MockPublisher] ERROR: failed to open {self.HUNGER_PORT_NAME}")
             return False
@@ -94,8 +113,8 @@ class MockPublisher(yarp.RFModule):
 
         print(
             f"[MockPublisher] Ready — "
-            f"context every {self.context_period}s, "
-            f"HS every {self.hs_period}s"
+            f"context every {self.context_period}s (label flip p={self.LABEL_FLIP_PROB}), "
+            f"HS every {self.hs_period}s (graph transitions, starting {self.current_hs})"
         )
         return True
 
@@ -108,10 +127,13 @@ class MockPublisher(yarp.RFModule):
 
         # --- context:o publish ---
         if now - self._last_context_ts >= self.context_period:
+            self.episode_id += 1
+            self.chunk      += 1
+            # Slowly drift the label (low-probability flip to avoid oscillation)
+            if random.random() < self.LABEL_FLIP_PROB:
+                self.label = 1 - self.label
             self._publish_context()
             self._last_context_ts = now
-            self.episode_id += 1   # increment episode_id each publish to simulate progress
-            self.chunk      += 1
 
         # --- hunger:o publish ---
         if now - self._last_hs_ts >= self.hs_period:
@@ -150,12 +172,18 @@ class MockPublisher(yarp.RFModule):
         """
         Mirrors InteractionManagerModule.updateModule() hunger publish:
             Bottle: String(hs)   where hs ∈ {"HS1", "HS2", "HS3"}
+        Transitions follow the allowed graph (random where multiple options exist):
+            HS1 → HS2
+            HS2 → HS1
+            HS2 → HS3
+            HS3 → HS2
         """
         if self.fixed_hs:
             hs = self.fixed_hs
         else:
-            hs = self.HS_STATES[self.hs_index % len(self.HS_STATES)]
-            self.hs_index += 1
+            next_states = self.HS_TRANSITIONS[self.current_hs]
+            hs = random.choice(next_states)
+            self.current_hs = hs
 
         b = self.hunger_port.prepare()
         b.clear()
@@ -179,10 +207,10 @@ def _build_argv_for_rf(args: argparse.Namespace) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mock publisher for STM context and IM hunger ports")
-    parser.add_argument("--context-period", type=float, default=2.0,  metavar="SEC",
-                        help="Seconds between context:o publishes (default: 2.0)")
-    parser.add_argument("--hs-period",      type=float, default=1.0,  metavar="SEC",
-                        help="Seconds between hunger:o publishes (default: 1.0)")
+    parser.add_argument("--context-period", type=float, default=5.0,   metavar="SEC",
+                        help="Seconds between context:o publishes (default: 5.0)")
+    parser.add_argument("--hs-period",      type=float, default=300.0, metavar="SEC",
+                        help="Seconds between hunger:o publishes (default: 300.0 = 5 min)")
     parser.add_argument("--episode-id",     type=int,   default=0,    metavar="N",
                         help="Starting episode ID (default: 0)")
     parser.add_argument("--chunk",          type=int,   default=-1,   metavar="N",
