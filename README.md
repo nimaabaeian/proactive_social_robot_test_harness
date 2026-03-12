@@ -1,7 +1,5 @@
-# Embodied Behaviour — iCub Adaptive Social Interaction
-
+# Always On Cognitive Architecture — `Embodied Behaviour` 
 > **Robot:** iCub · **Platform:** YARP · **Author:** Nima Abaeian
-
 ---
 
 ## Table of Contents
@@ -60,10 +58,10 @@ Camera frames
 ┌────────────────────────────────────────────────────────────────────┐
 │  perception.py  (VisionAnalyzer @ 20 Hz)                           │
 │  · MediaPipe face mesh → head pose, gaze direction                 │
-│  · Object recognition → bounding box, track_id, face_id           │
+│  · Object recognition → bounding box, track_id, face_id            │
 │  · Derives: distance class · attention class · time_in_view        │
 │  · Publishes one YARP Bottle per face → /alwayson/vision/          │
-│    landmarks:o                                                      │
+│    landmarks:o                                                     │
 └────────────────────────────────────────────────────────────────────┘
      │  per-face Bottle  (every frame)
      ▼
@@ -81,10 +79,10 @@ Camera frames
 │  interactionManager.py                                             │
 │  · Executes SS1/SS2/SS3 conversation tree (or hunger-feed tree)    │
 │  · Monitors that the target stays visible throughout               │
-│  · Speaks (TTS), listens (STT), generates replies (Azure LLM)     │
+│  · Speaks (TTS), listens (STT), generates replies (Azure LLM)      │
 │  · Registers new faces with the object-recognition system          │
 │  · Returns compact JSON result → faceSelector                      │
-│  · Broadcasts hunger state (HS1/HS2/HS3) at 1 Hz                  │
+│  · Broadcasts hunger state (HS1/HS2/HS3) at 1 Hz                   │
 └────────────────────────────────────────────────────────────────────┘
      │  compact JSON  (success, final_state, abort_reason, …)
      ▼
