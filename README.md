@@ -385,9 +385,10 @@ These handle user-initiated events that arise while no proactive interaction is 
 
 **Responsive Greeting**
 - Trigger: STT matches `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (word-boundary regex)
-- Condition: biggest-bbox face is a known person; the utterance itself is the attention signal — no gaze check needed
-- Cooldown: 10 s per person
-- Action: say `"Hi <name>"` + write `last_greeted`; wait 12 s for a follow-up; if received, enter a full SS3-style conversation loop (up to 3 turns, optional Telegram personalisation)
+- Candidate selection: pick the **biggest-bbox face among all visible faces**; the utterance itself is the attention signal — no gaze check needed
+- Cooldown: 10 s per candidate key (`<known_name>` for known users, `unknown:<track_id>` for unresolved users)
+- Action (known face): say `"Hi <name>"` + write `last_greeted`; wait 12 s for a follow-up; if received, enter a full SS3-style conversation loop (up to 3 turns, optional Telegram personalisation)
+- Action (unknown face): run a lightweight SS1-style intro in-place (`ss1_greeting` → ask name → one retry for name extraction), register the extracted name asynchronously, mark greeted-today, and say `"Nice to meet you"`
 
 **Responsive QR Acknowledgment**
 - Trigger: QR scan detected outside of any active interaction
